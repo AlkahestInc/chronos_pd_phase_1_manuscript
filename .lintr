@@ -1,0 +1,15 @@
+linters: linters_with_tags(
+    tags = c("common_mistakes", "robustness", "readability"),
+    object_usage_linter = NULL,
+    line_length_linter = NULL,
+    one_call_pipe_linter = NULL,
+    object_length_linter = NULL,
+    nonportable_path_linter = NULL,
+    absolute_path_linter = absolute_path_linter(),
+    missing_argument_linter = missing_argument_linter(except = c("distinct", "mutate", "select", "tibble", "tribble"))
+  )
+exclusions: list(
+    "data-raw",
+    "tests"
+  )
+encoding: "UTF-8"

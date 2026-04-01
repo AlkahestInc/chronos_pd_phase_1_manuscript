@@ -1,0 +1,555 @@
+---
+title: "Cohort L QC Report with Matching Sample"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+# install.packages(c("purrr", "htmltools", "plotly", "irlba", "Rtsne", "gtsummary", "mt", "future", "MatchIt", "relaimpo"))
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(broom)
+library(uwot)
+library(mt)
+library(irlba)
+library(Rtsne)
+library(gtsummary)
+library(future)
+library(MatchIt)
+library(knitr)
+
+source("/home/rstudio/gnpc/scope-analysis/R/qc_clinical.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/qc_proteomics.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_pca.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_tsne.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_umap.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_scatter.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_boxplot.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_plsda.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_variance_distribution.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_lod.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/linear_regression.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/tbl_coef_compare.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/qc_summary.R", echo = FALSE, print.eval = FALSE)
+source("/home/rstudio/gnpc/scope-analysis/R/plot_variance_stacked.R", echo = FALSE, print.eval = FALSE)
+```
+
+
+## Load Data and Selected Metadata Columns
+```{r, include=TRUE}
+input_version <- "v6"
+selected_contributor_code <- "L"
+
+metadata <- readRDS(paste0("/home/rstudio/data_prep/metadata/clinical_metadata_tbl_", input_version, "_contributor_", selected_contributor_code, ".rds"))
+annotations <- readRDS(paste0("/home/rstudio/data_prep/annotation/annotation_tbl_", input_version, ".rds"))
+protein_intensity <- readRDS(paste0("/home/rstudio/data_prep/proteomics/proteomic_tbl_", input_version, "_contributor_", selected_contributor_code, ".rds"))
+
+metadata <- metadata |> filter(!is.na(pd))
+protein_intensity <- protein_intensity |> filter(sample_id %in% metadata$sample_id)
+```
+
+## Table 1 Descriptive statistics for continuous and categorical variables (Before PCA outliers filtering and matching)
+```{r, summary-1, include=TRUE}
+summary_cols <- c(
+  "pd", "ad", "ftd", "als", "race", "age_at_visit", "sex", "years_of_education",
+  "resting_heart_rate_pulse",
+  "systolic_blood_pressure_sitting", "diastolic_blood_pressure_sitting",
+  "alcohol_hx", "smoking_hx", "bmi_cat", "diabetes", "mci_sci", "hyperlipidaemia",
+  "depression", "cognitive_test_score",
+  "cognitive_test_battery", "depression_test_battery", "sample_matrix", "sequential_visit_number"
+)
+continuous_cols <- c(
+  "age_at_visit", "years_of_education", "resting_heart_rate_pulse",
+  "systolic_blood_pressure_sitting", "diastolic_blood_pressure_sitting",
+  "cognitive_test_score"
+)
+
+metadata_w_dummie_col <- metadata
+metadata_w_dummie_col$Summary <- "summary"
+create_summary_table(
+  data = metadata_w_dummie_col,
+  id_col = "person_id",
+  group_col = "Summary",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive"
+)
+```
+
+
+## Table 2 Descriptive statistics for continuous and categorical variables per PD status (Before PCA outliers filtering and matching)
+```{r, include=TRUE}
+create_summary_table(
+  data = metadata,
+  id_col = "person_id",
+  group_col = "pd",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive",
+  show_pvalues = TRUE,
+  continuous_val_test_type = "auto"
+)
+```
+
+
+## Table 3 Descriptive statistics for continuous and categorical variables (Before PCA outliers filtering and matching) by sample
+```{r, summary-3, include=TRUE}
+metadata_w_dummie_col <- metadata
+metadata_w_dummie_col$Summary <- "summary"
+create_summary_table(
+  data = metadata_w_dummie_col,
+  id_col = "sample_id",
+  group_col = "Summary",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive"
+)
+```
+
+
+## Table 4 Descriptive statistics for continuous and categorical variables per PD status (Before PCA outliers filtering and matching) by sample
+```{r, include=TRUE}
+create_summary_table(
+  data = metadata,
+  id_col = "sample_id",
+  group_col = "pd",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive",
+  show_pvalues = TRUE,
+  continuous_val_test_type = "auto"
+)
+```
+
+## Protein intensity transformed to log2 scale
+```{r Protein intensity log2 transformation, results='asis'}
+protein_intensity_log2 <- protein_intensity |> mutate(across(where(is.numeric), ~ log2(.x + 1)))
+```
+## Select a set of more relevant columns
+```{r first-filtering, include=TRUE}
+## select metadata columns
+selected_metadata_cols <- c(
+  "sample_id", "person_id", "visit", "contributor_code", "sequential_visit_number",
+  "age_at_visit", "sex", "race", "years_of_education",
+  "resting_heart_rate_pulse", "systolic_blood_pressure_sitting",
+  "diastolic_blood_pressure_sitting", "alcohol_hx", "smoking_hx", "total_years_smoked",
+  "bmi_cat", "pd", "ad", "ftd", "als", "stroke", "tbi", "mci_sci", "diabetes",
+  "hypertension", "hyperlipidaemia", "depression", "anxiety",
+  "depression_inventory_score", "depression_test_battery", "cdr", "cognitive_test_date",
+  "cognitive_test_score", "computed_cognitive_test_score", "cognitive_test_battery",
+  "computed_clinical_diagnosis", "computed_cognitive_impairment", "sample_matrix"
+)
+
+filtered_metadata <- metadata |>
+  select(all_of(selected_metadata_cols))
+```
+
+## Missingness in Cohort Clinical Data
+```{r, include=TRUE}
+# Identify variable types
+## Note that at this step, it started with unfiltered metadata
+numeric_vars <- metadata |>
+  select(where(is.numeric)) |>
+  names()
+categorical_vars <- metadata |>
+  select(where(~ is.character(.) | is.factor(.))) |>
+  names()
+
+# Missingness summary for numeric variables
+missing_numeric <- metadata |>
+  summarise(across(all_of(numeric_vars), ~ mean(is.na(.)))) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_pct"
+  ) |>
+  mutate(type = "numeric")
+
+# Missingness summary for categorical variables
+missing_categorical <- metadata |>
+  summarise(across(all_of(categorical_vars), ~ mean(is.na(.)))) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_pct"
+  ) |>
+  mutate(type = "categorical")
+
+# Combine both summaries
+missing_summary <- bind_rows(missing_numeric, missing_categorical)
+
+# View
+ggplot(
+  missing_summary |> filter(missing_pct > 0.0),
+  aes(x = reorder(variable, missing_pct), y = missing_pct, fill = type)
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Column Missingness by Variable Type",
+    x = "Variable",
+    y = "Missingness (%)"
+  ) +
+  theme_minimal()
+```
+
+Then filter columns with more than 10% missingness, as well as all "-1" value columns. These columns may contain other values from different contributors but it may be missing (NA) for certain contributors. 
+```{r, include=TRUE}
+## more than 10% missingness cols are filtered except for required ones : age, sex, AD/FTD/ALS
+required_variables <- c("age_at_visit", "sex", "ad", "ftd", "als", "years_of_education", "resting_heart_rate_pulse", "diabetes", "mci_sci", "hyperlipidaemia", "cognitive_test_score")
+missing_pct_threshold <- 0.10
+columns_with_high_missingness <- missing_summary |>
+  filter(missing_pct >= missing_pct_threshold) |>
+  pull(variable)
+
+## remove these high missingness, as well as all "-1" (meaning NA) value columns
+filtered_metadata <- metadata |>
+  select(-all_of(columns_with_high_missingness), all_of(required_variables))
+
+## remove these all "-1" (meaning NA) value columns
+columns_with_all_neg1s <- filtered_metadata |>
+  select(where(~ all(.x == -1, na.rm = TRUE))) |>
+  colnames()
+filtered_metadata <- filtered_metadata |>
+  select(-all_of(columns_with_all_neg1s))
+```
+
+
+## Protein intensity sample median outliers
+```{r protein-intensity-sample-median}
+# Define protein list (columns to include)
+protein_list <- names(select(protein_intensity_log2, -sample_id))
+
+# Calculate per-sample median
+sample_median <- apply(protein_intensity_log2 |> dplyr::select(all_of(protein_list)), 1, median)
+
+# Compute mean and SD of sample medians
+mean_protein <- mean(sample_median)
+sd_protein <- sd(sample_median)
+
+# Flag outliers beyond ±5 SD
+plot_data <- data.frame(
+  sample_id = protein_intensity_log2$sample_id,
+  sample_median = sample_median,
+  outlier_sd = sample_median > mean_protein + 5 * sd_protein |
+    sample_median < mean_protein - 5 * sd_protein
+)
+
+# count the result rows
+nrow(plot_data)
+# count the result for outliers
+nrow(plot_data |> filter(outlier_sd == TRUE))
+print(plot_data |> filter(outlier_sd == TRUE))
+```
+
+
+```{r pca-outlier-filtering, include=TRUE}
+# Detect (some) PCA outliers
+pca_outlier_row_numbers <- pca.outlier(protein_intensity_log2 |> select(-sample_id))$outlier
+pca_outlier_sample_ids <- protein_intensity_log2 |>
+  slice(pca_outlier_row_numbers) |>
+  pull(sample_id)
+cat("Number of PCA outliers :", length(pca_outlier_sample_ids), "\n")
+filtered_protein_intensity_log2 <- protein_intensity_log2 |> filter(!sample_id %in% pca_outlier_sample_ids)
+filtered_metadata <- filtered_metadata |> filter(!sample_id %in% pca_outlier_sample_ids)
+```
+** Test if protein intensity sample median outliers are within the PCA outliers
+```{r}
+all(plot_data |> filter(outlier_sd == TRUE) |> pull(sample_id) %in% pca_outlier_sample_ids)
+
+## Check if these sample median outliers are also in the PCA outliers, if not, filter those out from further analysis
+if (!all(plot_data |> filter(outlier_sd == TRUE) |> pull(sample_id) %in% pca_outlier_sample_ids)) {
+  # filtering the sample median outliers
+  # this is done only for cohort F as these sample median outliers are not included in the PCA outliers
+  sample_median_outlier_ids <- plot_data |>
+    filter(outlier_sd == TRUE) |>
+    pull(sample_id)
+  filtered_metadata <- filtered_metadata |> filter(!sample_id %in% sample_median_outlier_ids)
+  filtered_protein_intensity_log2 <- filtered_protein_intensity_log2 |> filter(!sample_id %in% sample_median_outlier_ids)
+
+  # how many samples left
+  cat("Number of samples remain for protein ratio validation :", nrow(filtered_metadata), "\n")
+}
+```
+
+## PCA after Outliers Removed
+```{r add-dummie-ID-cols-to-non-outliers}
+copied_filtered_protein_intensity_log2 <- filtered_protein_intensity_log2
+copied_filtered_protein_intensity_log2$ID <- copied_filtered_protein_intensity_log2$sample_id
+copied_filtered_protein_intensity_log2$sample_id <- NULL
+
+copied_filtered_metadata <- filtered_metadata
+copied_filtered_metadata$ID <- copied_filtered_metadata$sample_id
+copied_filtered_metadata$sample_id <- NULL
+```
+```{r non-outliers-pca-panels}
+selected_categorical_vars <- categorical_vars[
+  vapply(categorical_vars, function(cat_var) {
+    n_unique <- length(unique(copied_filtered_metadata[[cat_var]]))
+    n_unique <= 50 && n_unique > 1
+  }, logical(1))
+]
+pca_res <- plot_PCA(
+  protein_intensity = copied_filtered_protein_intensity_log2,
+  metadata = copied_filtered_metadata,
+  var_name = selected_categorical_vars,
+  IDs_for_outliers = NULL, # c("ID")
+  nsd = 6,
+  exact = TRUE,
+  point_size = 1
+)
+pca_res$plots
+```
+
+## tSNE after Outliers Removed
+
+```{r non-outliers-tsne, results='asis'}
+for (cat_var in categorical_vars) {
+  ## do not plot for vars with too many or too few values
+  if (length(unique(copied_filtered_metadata[[cat_var]])) <= 50 &
+    length(unique(copied_filtered_metadata[[cat_var]])) > 1) {
+    tsne_plot <- plot_tSNE(
+      protein_intensity = copied_filtered_protein_intensity_log2,
+      metadata = copied_filtered_metadata,
+      var_name = cat_var,
+      IDs_for_tooltip = c("ID"),
+      title_name = paste0("tSNE Plot (", cat_var, ")"),
+      perplexity = 10,
+      point_size = 1
+    )
+    print(tsne_plot)
+  }
+}
+```
+
+## UMAP after Outliers Removed
+```{r non-outliers-umap, results='asis'}
+for (cat_var in categorical_vars) {
+  ## do not plot for vars with too many or too few values
+  if (length(unique(copied_filtered_metadata[[cat_var]])) <= 50 &
+    length(unique(copied_filtered_metadata[[cat_var]])) > 1) {
+    umap_plot <- plot_UMAP(
+      protein_intensity = copied_filtered_protein_intensity_log2,
+      metadata = copied_filtered_metadata,
+      var_name = cat_var,
+      IDs_for_tooltip = c("ID"),
+      title_name = paste0("UMAP Plot (", cat_var, ")"),
+      point_size = 1
+    )
+    print(umap_plot)
+  }
+}
+```
+
+
+## Variance Distribution
+```{r variance_plot_table, results='asis'}
+## plot_variance_distribution will by default perform log10 transformation on the protein intensity
+## so input here is non-log transformed
+result <- plot_variance_distribution(protein_intensity |> filter(!sample_id %in% pca_outlier_sample_ids))
+print(result$plot)
+
+# Text and spacing
+cat("\n\n###    \n\n")
+
+DT::datatable(
+  result$variance_table,
+  extensions = "Buttons",
+  options = list(
+    dom = "Bfrtip",
+    buttons = c("csv", "excel", "pdf"),
+    pageLength = 10,
+    scrollX = TRUE
+  ),
+  filter = "top",
+  rownames = FALSE
+)
+```
+
+
+
+## Matching Samples
+```{r matching-function}
+match_stratified_cohort <- function(
+  data,
+  predictors = c("age_at_visit", "sex", "ad"),
+  response = "pd",
+  tolerance_in_age = 5,
+  ratio = 1,
+  seed = 42,
+  method = "nearest",
+  distance = "mahalanobis",
+  formula = "pd ~ age_at_visit + sex + ad"
+) {
+  # Check required columns
+  required_vars <- all(all.vars(formula) %in% names(data))
+  if (!required_vars) {
+    stop("Some variables in the formula are not found in the data.")
+  }
+
+  # Build formula for sample matching
+  formula <- reformulate(predictors, response = response)
+
+  # Perform Mahalanobis nearest neighbor matching
+  set.seed(seed)
+  m.out <- matchit(
+    formula,
+    data = data,
+    method = method,
+    distance = distance,
+    caliper = c(age_at_visit = tolerance_in_age),
+    ratio = ratio
+  )
+  matched_metadata <- match.data(m.out)
+
+  return(
+    list(
+      m.out = m.out,
+      matched_metadata = matched_metadata
+    )
+  )
+}
+```
+
+```{r matching-samples, include=TRUE}
+matching_ratio <- 2 # ratio 2 for cohort L
+matched_output <- match_stratified_cohort(
+  data = filtered_metadata,
+  predictors = c("age_at_visit", "sex"), ## note here the predictors and response is for sample matching -- , "ad" is removed from the predictor list due to missingness
+  response = "pd",
+  tolerance_in_age = 5,
+  ratio = matching_ratio,
+  seed = 42,
+  method = "nearest",
+  distance = "mahalanobis",
+  formula = "pd ~ age_at_visit + sex"
+)
+# Check covariate balance before and after
+summary(matched_output$m.out)
+# Run regression on matched dataset
+validate_lm <- glm(pd ~ age_at_visit + sex, data = matched_output$matched_metadata, family = binomial())
+summary(validate_lm)
+
+matched_sample_ids <- matched_output$matched_metadata |> pull(sample_id)
+cat("Number of matched samples :", length(matched_sample_ids), "\n")
+matched_filtered_protein_intensity_log2 <- filtered_protein_intensity_log2 |> filter(sample_id %in% matched_sample_ids)
+matched_filtered_metadata <- matched_output$matched_metadata
+```
+
+## Table 5 Descriptive statistics for continuous and categorical variables (After PCA outliers filtering and matching)
+```{r, pca-outlier-rm-summary-1, include=TRUE}
+summary_cols <- c(
+  "pd", "ad", "ftd", "als", "race", "age_at_visit", "sex", "years_of_education",
+  "resting_heart_rate_pulse",
+  "systolic_blood_pressure_sitting", "diastolic_blood_pressure_sitting",
+  "alcohol_hx", "smoking_hx", "bmi_cat", "diabetes", "mci_sci", "hyperlipidaemia",
+  "depression", "cognitive_test_score",
+  "cognitive_test_battery", "depression_test_battery", "sample_matrix", "sequential_visit_number"
+)
+continuous_cols <- c(
+  "age_at_visit", "years_of_education", "resting_heart_rate_pulse",
+  "systolic_blood_pressure_sitting", "diastolic_blood_pressure_sitting",
+  "cognitive_test_score"
+)
+
+summary_cols <- summary_cols[!summary_cols %in% columns_with_all_neg1s]
+continuous_cols <- continuous_cols[!continuous_cols %in% columns_with_all_neg1s]
+
+matched_filtered_metadata_w_dummie_col <- matched_filtered_metadata
+matched_filtered_metadata_w_dummie_col$Summary <- "summary"
+create_summary_table(
+  data = matched_filtered_metadata_w_dummie_col,
+  id_col = "person_id",
+  group_col = "Summary",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive"
+)
+```
+
+
+
+## Table 6 Descriptive statistics for continuous and categorical variables per PD status (After PCA outliers filtering and matching)
+```{r, include=TRUE}
+create_summary_table(
+  data = matched_filtered_metadata,
+  id_col = "person_id",
+  group_col = "pd",
+  summary_cols = summary_cols,
+  continuous_cols = continuous_cols,
+  statistic_type = "comprehensive",
+  show_pvalues = TRUE,
+  continuous_val_test_type = "auto"
+)
+```
+
+
+#### Matching Samples PCA Panels
+
+```{r add-dummie-ID-cols-matching-samples}
+copied_matched_filtered_protein_intensity_log2 <- matched_filtered_protein_intensity_log2
+copied_matched_filtered_protein_intensity_log2$ID <- copied_matched_filtered_protein_intensity_log2$sample_id
+copied_matched_filtered_protein_intensity_log2$sample_id <- NULL
+
+copied_matched_filtered_metadata <- matched_filtered_metadata
+copied_matched_filtered_metadata <- copied_matched_filtered_metadata |> mutate(age_over_50 = if_else(age_at_visit > 50, "Yes", "No"))
+copied_matched_filtered_metadata$ID <- copied_matched_filtered_metadata$sample_id
+copied_matched_filtered_metadata$sample_id <- NULL
+```
+```{r pca-panels}
+selected_cat_vars_for_matching_samples <- c("sex", "age_over_50", "pd", "ad")
+
+pca_res <- plot_PCA(
+  protein_intensity = copied_matched_filtered_protein_intensity_log2,
+  metadata = copied_matched_filtered_metadata,
+  var_name = selected_cat_vars_for_matching_samples,
+  title_name = "PCA Plot",
+  nsd = 6,
+  exact = TRUE,
+  IDs_for_outliers = NULL,
+  ellipse_conf = 0.95,
+  point_size = 1,
+  label_outliers = TRUE,
+  custom_colors = NULL
+)
+pca_res$plots
+```
+
+
+## Matching Samples tSNE
+
+```{r tsne-matching-samples, results='asis'}
+for (cat_var in selected_cat_vars_for_matching_samples) {
+  tsne_plot <- plot_tSNE(
+    prot = copied_matched_filtered_protein_intensity_log2,
+    metadata = copied_matched_filtered_metadata,
+    var_name = cat_var,
+    IDs_for_tooltip = c("ID"),
+    title_name = paste0("tSNE Plot (", cat_var, ")"),
+    perplexity = 10,
+    point_size = 1
+  )
+  print(tsne_plot)
+}
+```
+
+
+## Matching Samples UMAP
+```{r umap-matching-samples, results='asis'}
+for (cat_var in selected_cat_vars_for_matching_samples) {
+  umap_plot <- plot_UMAP(
+    protein_intensity = copied_matched_filtered_protein_intensity_log2,
+    metadata = copied_matched_filtered_metadata,
+    var_name = cat_var,
+    IDs_for_tooltip = c("ID"),
+    title_name = paste0("UMAP Plot (", cat_var, ")"),
+    point_size = 1
+  )
+  print(umap_plot)
+}
+```

@@ -1,0 +1,55 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: check-added-large-files
+        args: ['--maxkb=200']
+    -   id: end-of-file-fixer
+        exclude: '\.Rd'
+
+-   repo: local
+    hooks:
+    -   id: forbid-to-commit-r-artefacts
+        name: Don't commit common R artifacts
+        entry: Cannot commit .Rhistory and .RData files
+        language: fail
+        files: (?i)\.(Rhistory|RData)$
+        # `exclude: <regex>` to allow committing specific files
+    -   id: forbid-to-commit-data-artefacts
+        name: Don't commit data artefacts
+        entry: Cannot commit .RDS, .parquet, .tsv, .csv, .gz, .pdf files
+        language: fail
+        files: (?i)\.(RDS|parquet|tsv|csv|gz|pdf)$
+        # `exclude: <regex>` to allow committing specific files
+    -   id: r-styler
+        name: Style R files
+        entry: Rscript
+        args: [--vanilla, git_hooks/styler.R]
+        language: system
+        types: [file]
+        files: (?i)\.(r|rmd|rnw|qmd|rprofile)$
+        exclude: 'renv/activate\.R'
+        pass_filenames: true
+        minimum_pre_commit_version: "2.13.0"
+    -   id: r-lintr
+        name: Lint R files
+        entry: Rscript
+        args: [--vanilla, git_hooks/lintr.R]
+        language: system
+        types: [file]
+        files: (?i)\.(r|rmd|rnw|qmd|rprofile)$
+        exclude: 'renv/activate\.R'
+        pass_filenames: true
+        minimum_pre_commit_version: "2.13.0"
+    # -   id: r-origin
+    #     name: Originize R files
+    #     entry: Rscript
+    #     args: [--vanilla, git_hooks/origin.R]
+    #     language: system
+    #     types: [file]
+    #     files: (?i)\.(r|rmd|qmd)$
+    #     exclude: 'renv/activate\.R'
+    #     pass_filenames: true
+    #     minimum_pre_commit_version: "2.13.0"
+ci:
+    autoupdate_schedule: monthly

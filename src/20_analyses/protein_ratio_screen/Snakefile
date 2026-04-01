@@ -1,0 +1,238 @@
+import random
+import sys
+
+sys.path.append("scripts/python")
+from utils import get_assay_ids, select_equally_spaced
+
+configfile: "config.yaml"
+OUT_PARENT_DIR = config["out_parent_dir"]
+
+# Set a specific seed to make random stuff deterministic
+random.seed(1234)
+
+################
+# Pseudo-rules #
+################
+
+#####
+# STAGE 1: Prepare all input datasets and extract metadata
+#####
+rule prepare_data:
+    """STAGE 1: Prepare all input datasets and extract metadata"""
+    input:
+        f"{OUT_PARENT_DIR}/assets/olink.parquet",
+        f"{OUT_PARENT_DIR}/assets/somalogic.parquet", 
+        f"{OUT_PARENT_DIR}/assets/alamar.parquet",
+        f"{OUT_PARENT_DIR}/assets/assay_ids.txt",
+        f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+#####
+# STAGE 2: Create train/test splits for all parameter sets
+#####
+rule prepare_splits:
+    """STAGE 2: Create train/test splits for all parameter sets"""
+    input:
+      [
+        expand(
+          f"{OUT_PARENT_DIR}/assets/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/{{split}}.parquet",
+          split=["training", "testing"],
+          **parameter_set
+        )
+        for parameter_set in config["parameter_sets"]
+      ],
+      f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+#####
+# STAGE 3: Train models
+#####
+# all: all protein denominators
+all_parquet_files = []
+for p in config["parameter_sets"]:
+  all_parquet_files += expand(
+    f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.parquet",
+    denominator = get_assay_ids(f"{OUT_PARENT_DIR}/assets/assay_ids.txt"),
+    **p
+  )
+rule model_all:
+  input:
+    lambda wildcards: [
+      get_denominator_files({
+        "out_parent_dir": OUT_PARENT_DIR,
+        **parameter_set
+      })
+      for parameter_set in config["parameter_sets"]
+    ],
+    f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+rule all:
+  input:
+    rules.prepare_data.input,
+    rules.prepare_splits.input,
+    rules.model_all.input,
+    f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+#####
+# Subsets of model analysis for testing purposes
+#####
+# fix_tiny test: 3 protein denominators (3 small jobs)
+rule model_fixed_tiny:
+    """STAGE 3 (tiny fixed test): Train models on 3 specific protein denominators (3 small jobs)"""
+    input:
+      [
+        expand(
+          f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.parquet",
+          denominator=["OID40001", "OID40002", "OID40003"],
+          **parameter_set
+        )
+        for parameter_set in config["parameter_sets"]
+      ],
+      f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+# fixed_small test: 3 protein denominators (1 small, 1 medium and 1 large job)
+rule model_fixed_small:
+    """STAGE 3 (small fixed test): Train models on 3 specific protein denominators (1 small, 1 medium and 1 large job)"""
+    input:
+      [
+        expand(
+          f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.parquet",
+          denominator=["seq.9997.12", "OID40001", "OID40002"],
+          **parameter_set
+        )
+        for parameter_set in config["parameter_sets"]
+      ],
+      f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+# equally_spaced test: n equally spaced files from all possible outputs
+def get_equally_spaced_files(wildcards):
+  checkpoints.extract_assay_ids.get(**wildcards)
+  all_files = []
+  for p in config["parameter_sets"]:
+    denominators = get_assay_ids(f"{OUT_PARENT_DIR}/assets/assay_ids.txt")
+    all_files += expand(
+      f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.parquet",
+      denominator=denominators,
+      **p
+    )
+  return select_equally_spaced(all_files, n=config["n_test_denominators"])
+
+rule model_equally_spaced:
+  input:
+    get_equally_spaced_files,
+    f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+
+################
+# Rules Proper #
+################
+rule get_olink_data:
+  input:
+    script = "scripts/R/get_olink_data.R",
+  output:
+    f"{OUT_PARENT_DIR}/assets/olink.parquet",
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla {input.script} --output={output}
+    """
+
+rule get_somalogic_data:
+  input:
+    script = "scripts/R/get_somalogic_data.R"
+  output:
+    f"{OUT_PARENT_DIR}/assets/somalogic.parquet"
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla {input.script} --output={output}
+    """
+
+rule get_alamar_data:
+  input:
+    script = "scripts/R/get_alamar_data.R"
+  output:
+    f"{OUT_PARENT_DIR}/assets/alamar.parquet"
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla {input.script} --output={output}
+    """
+
+rule initial_split:
+  input:
+    script = "scripts/R/initial_split.R",
+    olink = f"{OUT_PARENT_DIR}/assets/olink.parquet",
+    somalogic = f"{OUT_PARENT_DIR}/assets/somalogic.parquet",
+    alamar = f"{OUT_PARENT_DIR}/assets/alamar.parquet",
+  output:
+    training = f"{OUT_PARENT_DIR}/assets/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/training.parquet",
+    testing = f"{OUT_PARENT_DIR}/assets/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/testing.parquet",
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    mkdir --parents $(dirname {output.training}) $(dirname {output.testing})
+    Rscript --vanilla {input.script} --olink={input.olink} --somalogic={input.somalogic} --alamar={input.alamar} --window_start={wildcards.window_start} --window_end={wildcards.window_end} --strategy={wildcards.strategy} --training_proportion={wildcards.training_proportion} --training={output.training} --testing={output.testing}
+    """
+
+rule fit_model:
+  input:
+    script = "scripts/R/fit_model.R",
+    training = f"{OUT_PARENT_DIR}/assets/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/training.parquet",
+    testing = f"{OUT_PARENT_DIR}/assets/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/testing.parquet",
+  output:
+    f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.parquet"
+  log:
+    f"{OUT_PARENT_DIR}/logs/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/{{denominator}}.log"
+  params:
+    partitions = config["vfold_cv"]["partitions"],
+    repeats = config["vfold_cv"]["repeats"],
+    number = config["jobs"]["max_numerators_per_job"],
+    debug_level = config["jobs"]["debug_level"],
+    permute = config["training_data"]["permute"],
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    mkdir --parents $(dirname {output})
+    Rscript --vanilla {input.script} --permute={params.permute} --training={input.training} --testing={input.testing} --denominator={wildcards.denominator} --output={output} --number={params.number} --partitions={params.partitions} --repeats={params.repeats} --level={params.debug_level} &> {log}
+    """
+
+checkpoint extract_assay_ids:
+  input:
+    script = "scripts/R/extract_assay_ids.R",
+    olink = f"{OUT_PARENT_DIR}/assets/olink.parquet",
+    somalogic = f"{OUT_PARENT_DIR}/assets/somalogic.parquet",
+    alamar = f"{OUT_PARENT_DIR}/assets/alamar.parquet"
+  output:
+    f"{OUT_PARENT_DIR}/assets/assay_ids.txt"
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla {input.script} --olink={input.olink} --somalogic={input.somalogic} --alamar={input.alamar} --file={output}
+    """
+
+rule fit_model_performance:
+  input:
+    script = "scripts/R/run_performance.R",
+    dir = f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/denominator/",
+  output:
+    plot = f"{OUT_PARENT_DIR}/results/window_start={{window_start}}/window_end={{window_end}}/strategy={{strategy}}/train_prop={{training_proportion}}/fit_model_performance.pdf"
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla {input.script} --dir {input.dir},output/aws_renv/test,output/aws_conda/test --width 8 --height 6 --out {output.plot}
+    """
+
+rule session_info:
+  output:
+    f"{OUT_PARENT_DIR}/assets/sessionInfo.txt"
+  conda:
+    "envs/R.yaml"
+  shell:
+    """
+    Rscript --vanilla -e 'writeLines(capture.output(sessionInfo()), "{output}")'
+    """

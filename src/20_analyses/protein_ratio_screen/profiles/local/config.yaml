@@ -1,0 +1,10 @@
+#####
+# Local-specific settings
+#####
+use-conda: true
+cores: 2
+jobs: 2
+resources:
+  mem_mb: 12000
+show-failed-logs: true
+latency-wait: 60

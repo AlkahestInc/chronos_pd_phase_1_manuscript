@@ -1,0 +1,1544 @@
+---
+title: "UKB-RAP: Protein Expression Analysis"
+subtitle: "Single Protein and Protein Ratio"
+author:
+  - name: "Nathan Watson-Haigh"
+date-modified: last-modified
+date-format: "YYYY-MM-DDTHH:mm:ssZ"
+format:
+  html:
+    embed-resources: true
+    self-contained: true
+editor_options:
+  chunk_output_type: console
+toc: true
+toc-depth: 2
+---
+
+## Setup
+
+```{r}
+#| label: setup
+
+here::i_am("src/20_analyses/target_validation/uk_biobank/index.qmd")
+
+ukb_rap_working_dir <- "Users/Nathan"
+
+assets_dir <- here::here("assets")
+functions_dir <- here::here("functions")
+
+#####
+# Set which files to use as input to this quarto document
+#####
+case_control_pairs <- glue::glue("{ukb_rap_working_dir}/cohorts/pd_case_control_pairs.new.tsv.gz")
+pair_files <- c(
+  list_1 = here::here(glue::glue("{staging_input_data_dir}/list_1_v29452.tsv.gz")),
+  list_2 = here::here(glue::glue("{staging_input_data_dir}/list_2_v29451.tsv.gz")),
+  list_3 = here::here(glue::glue("{staging_input_data_dir}/list_3_v29453.tsv.gz"))
+)
+window_specs <- tibble::tribble(
+  ~"window_id",      ~"window_start", ~"window_end",
+  "[-2,0)",          -2,               0,
+  "[-3,-1)",         -3,              -1,
+  "[-4,-2)",         -4,              -2,
+  "[-5,-3)",         -5,              -3,
+  "[-6,-4)",         -6,              -4,
+  "[-7,-5)",         -7,              -5,
+  "[-8,-6)",         -8,              -6,
+  "[-10,-8)",       -10,              -8,
+  "[-Inf,-1)",     -Inf,              -1,
+  "[-Inf,-7)",     -Inf,              -7,
+  "[0,Inf)",          0,             Inf,
+  "[-9,-5)",         -9,              -5,
+  "[-7,-3)",         -7,              -3,
+  "[-5,-1)",         -5,              -1,
+  "[0,2)",            0,               2,
+  "[1,3)",            1,               3,
+  "[2,4)",            2,               4,
+  "[3,5)",            3,               5,
+)
+#####
+
+timestamp <- lubridate::now() |> format("%Y%m%d_%H%M%S_%z")
+
+staging_parent_dir <- here::here(glue::glue("staging/protein_ratio_analysis/{timestamp}"))
+staging_input_data_dir <- here::here(staging_parent_dir, "inputs")
+staging_output_data_dir <- here::here(staging_parent_dir, "outputs", "data")
+staging_output_plot_dir <- here::here(staging_parent_dir, "outputs", "plots")
+purrr::walk(
+  c(staging_input_data_dir, staging_output_plot_dir, staging_output_plot_dir, staging_output_data_dir),
+  dir.create,
+  showWarnings = FALSE,
+  recursive = TRUE,
+)
+
+all_results <- list()
+cobalt_long <- list()
+cobalt_plot <- list()
+cobalt_hist_plots_pdf <- list()
+volcano_plot <- list()
+
+.transform_data <- function(.data) {
+  .data |>
+    tidyr::pivot_longer(
+      cols = c(
+        tidyselect::starts_with("auc_assessment_mean"),
+        tidyselect::starts_with("sensitivity"),
+        tidyselect::starts_with("specificity"),
+        tidyselect::starts_with("accuracy")
+      ),
+      names_to = c("measure", "interval_start", "interval_end"),
+      names_sep = "_(?=-?(\\d+|Inf))",
+      values_to = "value"
+    )
+}
+```
+
+### Stage Input Data
+
+#### Protein Pairs of Interest (PPOI)
+
+```{r}
+#| label: stage-protein-pairs-of-interest
+
+dir.create(here::here("assets"), recursive = TRUE, showWarnings = FALSE)
+
+glue::glue(,
+  "{get_config()$input_dir}/name={name}/version={version}/dataset.parquet",
+  name = "Chronos_phase1_protein_ratio_list_1",
+  version = 29452
+) |>
+    arrow::open_dataset() |>
+    dplyr::collect() |>
+    .transform_data() |>
+    readr::write_tsv(
+        pair_files[["list_1"]]
+    )
+
+glue::glue(,
+  "{get_config()$input_dir}/name={name}/version={version}/dataset.parquet",
+  name = "Chronos_phase1_protein_ratio_list_1",
+  version = 29452
+) |>
+    arrow::open_dataset() |>
+    dplyr::collect() |>
+    .transform_data() |>
+    readr::write_tsv(
+        pair_files[["list_2"]]
+    )
+
+glue::glue(,
+  "{get_config()$input_dir}/name={name}/version={version}/dataset.parquet",
+  name = "Chronos_phase1_protein_ratio_list_3",
+  version = 29453
+) |>
+    arrow::open_dataset() |>
+    dplyr::collect() |>
+    .transform_data() |>
+    readr::write_tsv(
+        pair_files[["list_3"]]
+    )
+```
+
+#### Case/Control Pairings
+
+```{r}
+#| label: stage-case-control-pairings
+
+case_control_pairing_file <- here::here(staging_input_data_dir, "pd_case_control_pairs.tsv.gz")
+
+ukb_rap_download(
+  rap_path = case_control_pairs,
+  local_path = case_control_pairing_file
+)
+```
+
+#### Assay ID to Gene Symbol Mappings
+
+```{r}
+#| label: stage-assay_id2gene_symbol
+
+#####
+# Generate Lookup: assay_id_2_gene_symbol
+#####
+assay_id2gene_symbol_mapping_file <- here::here(glue::glue("{staging_input_data_dir}/protein_platform_uniprot_ids_v29404.tsv.gz"))
+
+glue::glue("{get_config()$input_dir}/name=protein_platform_uniprot_ids/version=29404/dataset.parquet") |>
+  arrow::open_dataset() |>
+  dplyr::collect() |>
+  readr::write_tsv(
+    assay_id2gene_symbol_mapping_file
+  )
+```
+
+### Load Staged Data
+
+```{r}
+#| label: load-protein-pairs-of-interest
+
+ppoi <- readr::read_tsv(
+  pair_files,
+  show_col_types = FALSE,
+  col_types = readr::cols_only(
+    protein1 = readr::col_character(),
+    protein2 = readr::col_character(),
+  ),
+  id = "File"
+) |>
+  dplyr::distinct() |>
+  dplyr::rename(
+    assay_id_numerator = protein1,
+    assay_id_denominator = protein2,
+  ) |>
+  dplyr::mutate(
+    pair_id = stringr::str_replace_all(glue::glue("{assay_id_numerator}_o_{assay_id_denominator}"), "-", "_")
+  )
+```
+
+```{r}
+#| label: load-case-control-pairings
+
+case_control_pairs <- readr::read_tsv(
+  case_control_pairing_file,
+  show_col_types = FALSE
+)
+```
+
+```{r}
+#| label: load-assay_id2gene_symbol
+
+assay_id_2_gene_symbol <- readr::read_tsv(
+  assay_id2gene_symbol_mapping_file,
+  col_types = readr::cols_only(
+    platform_id = readr::col_factor(),
+    gene_symbol = readr::col_factor(),
+  )
+) |>
+  dplyr::rename(
+     assay_id = platform_id
+  ) |>
+  tidyr::separate_rows(
+    gene_symbol,
+    sep = ":"
+  ) |>
+  dplyr::distinct(
+    assay_id,
+    gene_symbol
+  ) |>
+  tidyr::drop_na()
+```
+
+```{r}
+#| label: report-assy-id-2-gene-symbols-multiplicity
+
+# NOTE: Some of the `assay_id`s have multiple `gene_symbol`s associated with them.
+assay_id_2_gene_symbol |>
+  dplyr::group_by(assay_id) |>
+  dplyr::filter(
+    dplyr::n() > 1
+  )
+```
+
+```{r}
+#| label: map-gene-symbols-to-ppoi
+
+ppoi <- ppoi |>
+  #####
+  # Add gene symbols for numerators so we can map between our PPOIs and UKB Data
+  #####
+  dplyr::left_join(
+    assay_id_2_gene_symbol |>
+      dplyr::rename(
+        assay_id_numerator = assay_id,
+        gene_symbol_numerator = gene_symbol,
+      ),
+    by = dplyr::join_by(assay_id_numerator),
+    relationship = "many-to-many"
+  ) |>
+  #####
+  # Add gene symbols for denominators so we can map between our PPOIs and UKB Data
+  #####
+  dplyr::left_join(
+    assay_id_2_gene_symbol |>
+      dplyr::rename(
+        assay_id_denominator = assay_id,
+        gene_symbol_denominator = gene_symbol,
+      ),
+    by = dplyr::join_by(assay_id_denominator),
+    relationship = "many-to-many"
+  )
+```
+
+### Define Data Codings Used by Various UKB Data Fields
+
+```{r}
+#| label: load-ukb-data-coding
+
+data_coding <- list()
+
+# https://biobank.ctsu.ox.ac.uk/crystal/coding.cgi?id=9
+data_coding[[9L]] <- tibble::tribble(
+  ~"coding",  ~"meaning",
+  0L,         "Female",
+  1L,         "Male",
+)
+```
+
+### Get All UKB Participants
+
+```{r}
+#| label: load-all-ukb-participants
+
+all_participants <- tibble::tribble(
+  ~"field",          ~"label",
+  "participant.eid", "Participant_ID",
+) |>
+  dplyr::filter(
+    field == "participant.eid"
+  ) |>
+  ukb_rap_get_cohort_data(
+    cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+  )
+```
+
+#### Get/Define Participant Metadata:
+
+##### Common Metadata
+
+```{r}
+#| label: load-participant-metadata
+
+#####
+# Year of Birth
+#####
+all_participants <- all_participants |>
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",                  ~"label",
+      "participant.eid",         "Participant_ID",
+      "participant.p34",         "Year of Birth",
+    ) |>
+      ukb_rap_get_cohort_data(
+        cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+      ) |>
+      dplyr::filter(
+        !is.na(coding)
+      ) |>
+      dplyr::select(
+        Participant_ID,
+        YOB = coding
+      ),
+    by = dplyr::join_by("Participant_ID")
+  )
+
+#####
+# Date of Death
+#####
+all_participants <- all_participants |>
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",                  ~"label",
+      "participant.eid",         "Participant_ID",
+      "participant.p40000_i0",   "Date of Death | Instance 0",
+      "participant.p40000_i1",   "Date of Death | Instance 1",
+    ) |>
+      ukb_rap_get_cohort_data(
+        cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+      ) |>
+      dplyr::filter(
+        !is.na(coding)
+      ) |>
+      dplyr::distinct(
+        Participant_ID,
+        DOD = coding
+      ),
+    by = dplyr::join_by("Participant_ID")
+  )
+
+#####
+# Sex
+#####
+all_participants <- all_participants |>
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",                  ~"label",
+      "participant.eid",         "Participant_ID",
+      "participant.p31",         "Sex",
+    ) |>
+      ukb_rap_get_cohort_data(
+        cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+      ) |>
+      dplyr::filter(
+        !is.na(coding)
+      ) |>
+      #####
+      # Decode the Sex field
+      #####
+      dplyr::left_join(
+        data_coding[[9L]],
+        by = dplyr::join_by("coding")
+      ) |>
+      dplyr::select(
+        Participant_ID,
+        SEX = meaning
+      ),
+    by = dplyr::join_by("Participant_ID")
+  )
+
+#####
+# Townsend Deprivation Index (TDI)
+#####
+all_participants <- all_participants |>
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",                  ~"label",
+      "participant.eid",         "Participant_ID",
+      "participant.p22189",      "Townsend deprivation index at recruitment",
+    ) |>
+      ukb_rap_get_cohort_data(
+        cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+      ) |>
+      dplyr::filter(
+        !is.na(coding)
+      ) |>
+      dplyr::select(
+        Participant_ID,
+        TDI = coding
+      ),
+    by = dplyr::join_by("Participant_ID")
+  )
+```
+
+##### Disease-Specific Metadata
+
+UKB data fields:
+
+```{r}
+#| label: load-disease-specific-participant-metadata
+
+#####
+# PD Onset Date: Date G20 first reported
+#####
+all_participants <- all_participants |>
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",                  ~"label",
+      "participant.eid",         "Participant_ID",
+      "participant.p131022",     "Date G20 first reported (parkinson's disease)",
+    ) |>
+      ukb_rap_get_cohort_data(
+        cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+      ) |>
+      dplyr::filter(
+        !is.na(coding)
+      ) |>
+      dplyr::select(
+        Participant_ID,
+        ONSET_DATE.PD = coding
+      ),
+    by = dplyr::join_by("Participant_ID")
+  )
+```
+
+Derived data fields:
+
+```{r}
+#| label: calc-disease-specific-participant-metadata
+
+all_participants <- all_participants |>
+  dplyr::mutate(
+    AGE_OF_ONSET.PD = lubridate::interval(lubridate::make_date(year = YOB), ONSET_DATE.PD) / lubridate::years(1),
+  )
+```
+
+### Load Disease Status
+
+```{r}
+#| label: load-cohort-disease-statuses
+
+disease_status <- all_participants |>
+  #####
+  # Get the field 41270 data
+  #####
+  dplyr::left_join(
+    tibble::tribble(
+      ~"field",               ~"label",
+      "participant.eid",      "Participant_ID",
+      "participant.p41270",   "Diagnoses - ICD10",
+    ) |>
+    ukb_rap_get_cohort_data(
+      cohort_rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/All Participants")
+    ),
+    by = dplyr::join_by("Participant_ID")
+  ) |>
+  #####
+  # Parse out the ICD10 values
+  #####
+  dplyr::select(
+    Participant_ID,
+    p41270 = coding
+  ) |>
+  dplyr::mutate(
+    p41270 = stringr::str_remove_all(p41270, "\\[|\\]|\"")
+  ) |>
+  tidyr::separate_rows(
+    p41270,
+    sep = ","
+  ) |>
+  #####
+  # Determine who has what diseases based on the ICD10 codes found
+  #####
+  dplyr::group_by(Participant_ID) |>
+  dplyr::summarise(
+    HAS_HYPERTENSION = any(stringr::str_starts(.data[["p41270"]], "I10")),
+    HAS_T2D =          any(stringr::str_starts(.data[["p41270"]], "E11")),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    dplyr::across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))
+  )
+```
+
+### Load Proteomics Data
+
+```{r}
+#| label: load-proteomics-data
+
+proteomics_data <- ukb_rap_load_proteomics_data(rap_path = glue::glue("{ukb_rap_working_dir}/cohorts/With Proteomics.proteomics.RData"))
+
+# Ignore he stored participant metadata, we'll use the metadata already obtained above from UKB
+proteomics_data[["participant_metadata"]] <- NULL
+proteomics_data[["row_metadata"]] <- proteomics_data[["row_metadata"]] |>
+  dplyr::rename(
+    Participant_ID = `Participant ID`
+  )
+
+# Add col metadata
+proteomics_data[["col_metadata"]] <- tibble::tibble(
+  gene_symbol = proteomics_data[["data"]] |>
+    dplyr::select(-Sample_ID) |>
+    colnames()
+)
+```
+
+#### Restrict Proteomics Data to That Required for the Analysis
+
+Subset the data to the participants of interest:
+
+```{r}
+
+#####
+# participants - rows
+#####
+required_rows <- proteomics_data[["row_metadata"]] |>
+  dplyr::semi_join(
+    case_control_pairs,
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  dplyr::select(Sample_ID)
+
+#####
+# Subset the metadata first
+#####
+proteomics_data[["row_metadata"]] <- proteomics_data[["row_metadata"]] |>
+  dplyr::semi_join(
+    required_rows,
+    by = dplyr::join_by(Sample_ID)
+  )
+
+#####
+# Subset the data second
+#####
+proteomics_data[["data"]] <- proteomics_data[["data"]] |>
+  #####
+  # Select the samples
+  #####
+  dplyr::semi_join(
+    proteomics_data[["row_metadata"]],
+    by = dplyr::join_by(Sample_ID)
+  )
+```
+
+```{r}
+
+proteomics_data_long <- proteomics_data[["data"]] |>
+  # Make data long format
+  tidyr::pivot_longer(
+    cols = -Sample_ID,
+    names_to = "Protein",
+    values_to = "NPX"
+  )
+```
+
+#### Define Sample-Level Metadata
+
+##### Common Metadata
+
+```{r}
+#| label: calc-sample-metadata
+
+proteomics_data[["row_metadata"]] <- proteomics_data[["row_metadata"]] |>
+  dplyr::left_join(
+    all_participants |>
+      dplyr::select(
+        Participant_ID,
+        YOB
+      ),
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  dplyr::mutate(
+    AGE = lubridate::interval(lubridate::make_date(year = YOB), `Date of attending assessment centre`) / lubridate::years(1),
+  ) |>
+  dplyr::select(
+    -YOB
+  )
+```
+
+##### Case/Control Pair Metadata
+
+```{r}
+#| label: calc-cohort-specific-sample-metadata
+
+#####
+# Case/Control Metadata
+#####
+proteomics_data[["row_metadata"]] <- proteomics_data[["row_metadata"]] |>
+  dplyr::left_join(
+    case_control_pairs,
+    by = dplyr::join_by(Participant_ID)
+  )
+
+#####
+# Derived fields
+#####
+proteomics_data[["row_metadata"]] <- proteomics_data[["row_metadata"]] |>
+  #####
+  # Join on ONSET_DATE.PD
+  #####
+  dplyr::left_join(
+    all_participants |>
+      dplyr::select(
+        Participant_ID,
+        ONSET_DATE.PD
+      ),
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  #####
+  # Within each pair, fill ONSET_DATE.PD using the first value
+  #####
+  dplyr::group_by(pair) |> 
+  dplyr::mutate(
+    ONSET_DATE.PD = dplyr::first(ONSET_DATE.PD, na_rm = TRUE)
+  ) |> 
+  dplyr::ungroup() |>
+  #####
+  # Calculate other derived fields
+  #####
+  dplyr::mutate(
+    YEARS_SINCE_ONSET.PD = lubridate::interval(ONSET_DATE.PD, `Date of attending assessment centre`) / lubridate::years(1),
+  ) |>
+  dplyr::select(
+    -ONSET_DATE.PD
+  )
+```
+
+## Proteomics Analysis
+
+```{r}
+#| label: functions-regression
+
+gene_symbols <- list()
+
+.save_dataset <- function(tbl, filename) {
+  
+  dir.create(
+    dirname(filename),
+    showWarnings = FALSE,
+    recursive = TRUE,
+  )
+  
+  if (stringr::str_ends(filename, "parquet")) {
+    tbl |> arrow::write_parquet(filename)
+  } else if (stringr::str_ends(filename, "tsv|tsv.gz")) {
+    tbl |> readr::write_tsv(filename)
+  } else if (stringr::str_ends(filename, "csv|csv.gz")) {
+    tbl |> readr::write_csv(filename)
+  } else {
+    stop(glue::glue("Unsupported file suffix in filename: {filename}"))
+  }
+  
+  invisible(tbl)
+}
+```
+
+```{r}
+#| label: prep-proteomics-data
+
+gene_symbols[["single_protein"]] <- proteomics_data[["col_metadata"]]
+
+single_protein_data <- proteomics_data_long |>
+  dplyr::semi_join(
+    gene_symbols[["single_protein"]],
+    by = dplyr::join_by(Protein == gene_symbol)
+  ) |>
+  dplyr::left_join(
+    proteomics_data[["row_metadata"]],
+    by = dplyr::join_by("Sample_ID")
+  ) |>
+  dplyr::left_join(
+    disease_status,
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  #####
+  # Join participant metadata
+  #####
+  dplyr::left_join(
+    all_participants,
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  #####
+  # Make some variables a factor
+  #####
+  dplyr::mutate(
+    group = factor(group, levels = c("control.eid", "case.eid")),
+    SEX = factor(SEX),
+    HAS_T2D = factor(HAS_T2D),
+    HAS_HYPERTENSION = factor(HAS_HYPERTENSION),
+    YEARS_SINCE_ONSET_CATEGORY = cut(
+      YEARS_SINCE_ONSET.PD,
+      breaks = c(-Inf, -10, -5, 0, 5, 10, Inf),
+      right = FALSE
+    )
+  ) |>
+  dplyr::filter(
+    !is.na(NPX)
+  )
+
+future::plan(future::multisession)
+```
+
+### Single Protein Linear Regression Analysis
+
+Let's start with the simplest linear regression with predictors of group, years since PD onset, and the covariates you used for logistic regression.
+
+#### Perform Adjusted Linear Regression
+
+```{r}
+
+all_results[["single_protein"]] <- single_protein_data |>
+  dplyr::rename(
+    YEARS_SINCE_ONSET = YEARS_SINCE_ONSET.PD
+  ) |>
+  dplyr::group_by(
+    Protein,
+  ) |>
+  tidyr::nest() |>
+  # Set an explicit column ordering
+  dplyr::select(
+    Protein,
+    data,
+  ) |>
+  furrr::future_pmap(function(Protein, data) {
+    # Force future to send this global variable to each worker
+    staging_dir <- staging_output_data_dir
+    
+    data |>
+      #####
+      # For participants with more than 1 sample in the window, pick the middle one
+      #####
+      pick_single_sample_per_participant(strategy = "middle") |>
+      #####
+      # Save each dataset to a HIVE-style directory structure of parquet files
+      #####
+      .save_dataset(
+        filename = glue::glue("{staging_dir}/adjusted_linear_regression_data/protein={Protein}/lr_data.parquet")
+      ) |>
+      #####
+      # Apply the adjusted linear regression model
+      #####
+      apply_linear_regression_model_to_data(
+        model = stats::as.formula("NPX ~ group + YEARS_SINCE_ONSET_CATEGORY + SEX + YOB"),
+        exposure = "groupcase.eid"
+      ) |>
+      #####
+      # Add info about time-slice requested
+      #####
+      dplyr::mutate(
+        Protein = !!Protein,
+      )
+    },
+    .options = furrr::furrr_options(seed = TRUE)
+  ) |>
+  dplyr::bind_rows() |>
+  #####
+  # Ensure the columns are in the same order as previous results
+  #####
+  dplyr::relocate(
+    Protein,
+    n_samples,
+  )
+```
+
+#### Save Results
+
+```{r}
+#| label: write-results
+
+all_results[["single_protein"]] |>
+  readr::write_tsv(
+    here::here(staging_output_data_dir, "ukb_single_protein_adjusted_linear_regression.tsv.gz")
+  )
+```
+
+#### Plot Results
+
+##### Balance Measures in Covariates
+
+```{r}
+
+cobalt_long[["single_protein"]] <- all_results[["single_protein"]] |>
+  dplyr::select(tidyselect::starts_with("cobalt_")) |>
+  tidyr::pivot_longer(
+    cols = tidyselect::everything(),
+    names_to = "covariate",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    interval_colours = dplyr::case_when(
+      abs(value) >= 0.2 ~ "lightcoral",
+      abs(value) >= 0.1 ~ "tan1",
+      .default = "palegreen3"
+    )
+  )
+
+cobalt_plot[["single_protein"]] <- cobalt_long[["single_protein"]] |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = value,
+      fill = interval_colours
+    )
+  ) +
+  ggplot2::geom_histogram(
+    binwidth = 0.025,
+    colour = "white",
+  ) +
+  ggplot2::facet_wrap(
+    ~ covariate,
+    scales = "free_y",
+    labeller = ggplot2::labeller(
+      covariate = function(x) gsub("^cobalt_", "", x)
+    )
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::labs(
+    x = "Balance Statistic",
+    y = "Count"
+  ) +
+  ggplot2::expand_limits(
+    x = c(-1, 1)
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(-1, 1, by = 0.2)
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1
+    )
+  )
+
+cobalt_hist_plots_pdf[["single_protein"]] <- here::here(glue::glue("{staging_output_plot_dir}/cobalt_hist_single_protein.pdf"))
+dir.create(dirname(cobalt_hist_plots_pdf[["single_protein"]]), showWarnings = FALSE, recursive = TRUE)
+
+pdf(cobalt_hist_plots_pdf[["single_protein"]], width = 15.0, height = 5.0)
+cobalt_plot[["single_protein"]]
+dev.off()
+```
+
+##### Volcano Plots
+
+```{r}
+#! label: prep-plot-volcano
+
+#####
+# Setup base volcano plot
+#####
+volcano_plot[["single_protein"]] <- all_results[["single_protein"]] |>
+  plot_volcano(x = "beta", title = "Volcano Plot of Adjusted Linear Regression Results", x_lab = "beta")
+```
+
+```{r}
+#! label: plot-volcanos
+
+#####
+# Plot a single volcano containing all results
+#####
+ggplot2::ggsave(
+  filename = here::here(glue::glue("{staging_output_plot_dir}/volcano_single_protein.pdf")),
+  plot = volcano_plot[["single_protein"]],
+  width = 6.0, height = 4.0, units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+##### Protein NPX
+
+```{r}
+#! label: plot-pairs-expression-profiles
+
+all_proteins_pdf <- list()
+
+all_proteins_pdf[["single_protein"]] <- here::here(glue::glue("{staging_output_plot_dir}/all_proteins_UKB.pdf"))
+dir.create(dirname(all_proteins_pdf[["single_protein"]]), showWarnings = FALSE, recursive = TRUE)
+
+subdir_gene_symbol <- here::here(glue::glue("{staging_output_plot_dir}/proteins"))
+dir.create(subdir_gene_symbol, showWarnings = FALSE, recursive = TRUE)
+    
+single_protein_data |>
+  dplyr::rename(
+    YEARS_SINCE_ONSET = YEARS_SINCE_ONSET.PD
+  ) |>
+  dplyr::group_by(Protein) |>
+  tidyr::nest() |>
+  purrr::pwalk(function(Protein, data) {
+    
+    p <- data |>
+      plot_protein(y_var = "NPX", symmetric.y = TRUE) +
+      ggplot2::facet_wrap(
+        glue::glue("{Protein}<br /><span style='font-size:7pt;color:gray;'>{Protein}</span>") ~ .,
+        ncol = 1L,
+        scales = "free_y"
+      ) +
+      ggplot2::theme(
+        strip.text.x = ggtext::element_markdown()
+      )
+    
+    # Also create individual plot files
+    protein_plot_file <- here::here(glue::glue("{staging_output_plot_dir}/proteins/{Protein}_UKB.pdf"))
+    dir.create(dirname(protein_plot_file), showWarnings = FALSE, recursive = TRUE)
+    ggplot2::ggsave(
+      filename = protein_plot_file,
+      plot = p,
+      width = 3.0, height = 4.5, units = "in",
+      dpi = 600,
+      bg = "white"
+    )
+  })
+```
+
+### Single Protein Logistic Regression Analysis
+
+#### Perform Logistic Regression
+
+```{r}
+
+all_results[["single_protein_logistic_regression"]] <- single_protein_data |>
+  dplyr::rename(
+    YEARS_SINCE_ONSET = YEARS_SINCE_ONSET.PD
+  ) |>
+  dplyr::group_by(
+    Protein,
+  ) |>
+  tidyr::nest() |>
+  # Set an explicit column ordering
+  dplyr::select(
+    Protein,
+    data,
+  ) |>
+  #####
+  # Create every combination of pair_id and windows
+  #####
+  tidyr::crossing(window_specs) |>
+  furrr::future_pmap(function(Protein, data, window_id, window_start, window_end) {
+    # Force future to send this global variable to each worker
+    staging_dir <- staging_output_data_dir
+    
+    logger::log_info("Protein={Protein} window_id={window_id}")
+    
+    data |>
+      #####
+      # Restrict our data to the time-slice requested
+      #####
+      dplyr::filter(
+        YEARS_SINCE_ONSET >= window_start,
+        YEARS_SINCE_ONSET < window_end,
+      ) |>
+      #####
+      # For participants with more than 1 sample in the window, pick the middle one
+      #####
+      pick_single_sample_per_participant(strategy = "middle") |>
+      #####
+      # Save each dataset to a HIVE-style directory structure of parquet files
+      #####
+      .save_dataset(
+        filename = glue::glue("{staging_dir}/single_protein_logistic_regression_data/protein={Protein}/window_id={window_id}/sp_logistic_regression_data.parquet")
+      ) |>
+      #####
+      # Apply the logistic regression model
+      #####
+      apply_logistic_regression_model_to_window(
+        model = stats::as.formula("group ~ SEX + YOB + NPX"),
+        exposure = "NPX"
+      ) |>
+      #####
+      # Add info about time-slice requested
+      #####
+      dplyr::mutate(
+        Protein = !!Protein,
+
+        # Reconstruct the window_id using the start and end
+        window_id = glue::glue("[{window_start},{window_end})"),
+        window_start = window_start,
+        window_end = window_end,
+      )
+    },
+    .options = furrr::furrr_options(seed = TRUE)
+  ) |>
+  dplyr::bind_rows() |>
+  #####
+  # Ensure the columns are in the same order as previous results
+  #####
+  dplyr::relocate(
+    Protein,
+    window_id,
+    window_start,
+    window_end,
+    n_samples,
+  )
+```
+
+#### Save Results
+
+```{r}
+
+all_results[["single_protein_logistic_regression"]] |>
+  readr::write_tsv(
+    here::here(staging_output_data_dir, "ukb_single_protein_logistic_regression.tsv.gz")
+  )
+```
+
+#### Plot Results
+
+##### Balance Measures in Covariates
+
+```{r}
+
+cobalt_long[["single_protein_logistic_regression"]] <- all_results[["single_protein_logistic_regression"]] |>
+  dplyr::select(tidyselect::starts_with("cobalt_")) |>
+  tidyr::pivot_longer(
+    cols = tidyselect::everything(),
+    names_to = "covariate",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    interval_colours = dplyr::case_when(
+      abs(value) >= 0.2 ~ "lightcoral",
+      abs(value) >= 0.1 ~ "tan1",
+      .default = "palegreen3"
+    )
+  )
+
+cobalt_plot[["single_protein_logistic_regression"]] <- cobalt_long[["single_protein_logistic_regression"]] |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = value,
+      fill = interval_colours
+    )
+  ) +
+  ggplot2::geom_histogram(
+    binwidth = 0.025,
+    colour = "white",
+  ) +
+  ggplot2::facet_wrap(
+    ~ covariate,
+    scales = "free_y",
+    labeller = ggplot2::labeller(
+      covariate = function(x) gsub("^cobalt_", "", x)
+    )
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::labs(
+    x = "Balance Statistic",
+    y = "Count"
+  ) +
+  ggplot2::expand_limits(
+    x = c(-1, 1)
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(-1, 1, by = 0.2)
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1
+    )
+  )
+
+cobalt_hist_plots_pdf[["single_protein_logistic_regression"]] <- here::here(glue::glue("{staging_output_plot_dir}/cobalt_hist_single_protein_logistic_regression.pdf"))
+dir.create(dirname(cobalt_hist_plots_pdf[["single_protein_logistic_regression"]]), showWarnings = FALSE, recursive = TRUE)
+
+pdf(cobalt_hist_plots_pdf[["single_protein_logistic_regression"]], width = 15.0, height = 5.0)
+cobalt_plot[["single_protein_logistic_regression"]]
+dev.off()
+```
+
+##### Volcano Plots
+
+```{r}
+
+#####
+# Setup base volcano plot
+#####
+volcano_plot[["single_protein_logistic_regression"]] <- all_results[["single_protein_logistic_regression"]] |>
+  plot_volcano(x = "log_or") + ggplot2::geom_point(
+    alpha = 0.7,
+    shape = 16
+  )
+```
+
+```{r}
+#! label: plot-volcanos
+
+#####
+# Plot a single volcano containing all results
+#####
+ggplot2::ggsave(
+  filename = here::here(glue::glue("{staging_output_plot_dir}/volcano_single_protein_logistic_regression.pdf")),
+  plot = volcano_plot[["single_protein_logistic_regression"]],
+  width = 6.0, height = 4.0, units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+#####
+# Plot a volcano for each window analysed
+#####
+pdf(here::here(glue::glue("{staging_output_plot_dir}/volcano_by_window_single_protein_logistic_regression.pdf")), width = 6.0, height = 4.0)
+for (w in unique(all_results[["single_protein_logistic_regression"]][["window_id"]])) {
+  volcano_plot_window <- volcano_plot[["single_protein_logistic_regression"]] +
+    ggplot2::geom_point(
+      data = dplyr::filter(all_results[["single_protein_logistic_regression"]], window_id == w),
+      alpha = 0.7,
+      shape = 16
+    ) +
+    ggplot2::labs(
+      subtitle = glue::glue("Window: {w}")
+    ) +
+    ggplot2::theme_minimal()
+  
+  print(volcano_plot_window)
+}
+dev.off()
+```
+
+### Protein Ratio Analysis
+
+Subset the data to the proteins of interest:
+
+```{r}
+
+#####
+# gene_symbols - columns
+#####
+gene_symbols[["protein_ratio"]] <- ppoi |>
+  tidyr::pivot_longer(
+    cols = c(gene_symbol_numerator, gene_symbol_denominator),
+    values_to = "gene_symbol"
+  ) |>
+  dplyr::distinct(
+    gene_symbol
+  ) |>
+  dplyr::arrange(
+    gene_symbol
+  )
+```
+
+#### Calculate Protein Ratios
+
+```{r}
+#| label: calc-protein-ratios
+
+ratio_data_ppoi <- ppoi |>
+  #####
+  # Add on the NPX data for the numerator
+  #####
+  dplyr::inner_join(
+    proteomics_data_long |>
+      dplyr::rename(NPX.numerator = NPX),
+    by = dplyr::join_by(
+      "gene_symbol_numerator" == "Protein"
+    ),
+    relationship = "many-to-many"
+  ) |>
+  #####
+  # Add on the NPX data for the denominator from the matching sample
+  #####
+  dplyr::inner_join(
+    proteomics_data_long |>
+      dplyr::rename(NPX.denominator = NPX),
+    by = dplyr::join_by(
+      "Sample_ID",
+      "gene_symbol_denominator" == "Protein"
+    ),
+    relationship = "many-to-many"
+  ) |>
+  dplyr::mutate(
+    ratio = NPX.numerator - NPX.denominator
+  )
+```
+
+#### Extract Data for Logistic Regression
+
+```{r}
+#| label: prep-logistic-regression
+
+lr_data <- ratio_data_ppoi |>
+  dplyr::left_join(
+    proteomics_data[["row_metadata"]],
+    by = dplyr::join_by("Sample_ID")
+  ) |>
+  dplyr::left_join(
+    disease_status,
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  #####
+  # Join participant metadata
+  #####
+  dplyr::left_join(
+    all_participants,
+    by = dplyr::join_by(Participant_ID)
+  ) |>
+  #####
+  # Make some variables a factor
+  #####
+  dplyr::mutate(
+    group = factor(group, levels = c("control.eid", "case.eid")),
+    SEX = factor(SEX),
+    HAS_T2D = factor(HAS_T2D),
+    HAS_HYPERTENSION = factor(HAS_HYPERTENSION),
+  ) |>
+  dplyr::filter(
+    !is.na(ratio)
+  )
+```
+
+#### Perform Logistic Regression
+
+```{r}
+#| label: perform-logistic-regression
+
+all_results[["protein_ratio"]] <- lr_data |>
+  dplyr::rename(
+    YEARS_SINCE_ONSET = YEARS_SINCE_ONSET.PD
+  ) |>
+  dplyr::group_by(
+    pair_id,
+    gene_symbol_numerator,
+    gene_symbol_denominator,
+  ) |>
+  tidyr::nest() |>
+  # Set an explicit column ordering
+  dplyr::select(
+    pair_id,
+    gene_symbol_numerator,
+    gene_symbol_denominator,
+    data,
+  ) |>
+  #####
+  # Create every combination of pair_id and windows
+  #####
+  tidyr::crossing(window_specs) |>
+  furrr::future_pmap(function(pair_id, gene_symbol_numerator, gene_symbol_denominator, data, window_id, window_start, window_end) {
+    # Force future to send this global variable to each worker
+    staging_dir <- staging_output_data_dir
+    
+    data |>
+      #####
+      # Restrict our data to the time-slice requested
+      #####
+      dplyr::filter(
+        YEARS_SINCE_ONSET >= window_start,
+        YEARS_SINCE_ONSET < window_end,
+      ) |>
+      #####
+      # For participants with more than 1 sample in the window, pick the middle one
+      #####
+      pick_single_sample_per_participant(strategy = "middle") |>
+      #####
+      # Save each dataset to a HIVE-style directory structure of parquet files
+      #####
+      .save_dataset(
+        filename = glue::glue("{staging_dir}/logistic_regression_data/pair_id={pair_id}/window_id={window_id}/lr_data.parquet")
+      ) |>
+      #####
+      # Apply the logistic regression model
+      #####
+      apply_logistic_regression_model_to_window(
+        model = stats::as.formula("group ~ SEX + YOB + ratio"),
+        exposure = "ratio"
+      ) |>
+      #####
+      # Add info about time-slice requested
+      #####
+      dplyr::mutate(
+        pair_id = pair_id,
+        gene_symbol_numerator = gene_symbol_numerator,
+        gene_symbol_denominator = gene_symbol_denominator,
+        
+        # Reconstruct the window_id using the start and end
+        window_id = glue::glue("[{window_start},{window_end})"),
+        window_start = window_start,
+        window_end = window_end,
+      )
+    },
+    .options = furrr::furrr_options(seed = TRUE)
+  ) |>
+  dplyr::bind_rows() |>
+  #####
+  # Add back source file info for each PPOI
+  #####
+  dplyr::left_join(
+    ppoi |>
+      dplyr::distinct(
+        pair_id,
+        File,
+      ),
+    by = dplyr::join_by(pair_id)
+  ) |>
+  #####
+  # Add back assay_id info for each PPOI
+  #####
+  dplyr::left_join(
+    ppoi |>
+      dplyr::distinct(
+        pair_id,
+        gene_symbol_numerator,
+        gene_symbol_denominator,
+        assay_id_numerator,
+        assay_id_denominator,
+      ),
+    by = dplyr::join_by(
+      pair_id,
+      gene_symbol_numerator,
+      gene_symbol_denominator,
+    ),
+  ) |>
+  #####
+  # Ensure the columns are in the same order as previous results
+  #####
+  dplyr::relocate(
+    File,
+    pair_id,
+    gene_symbol_numerator,
+    gene_symbol_denominator,
+    assay_id_numerator,
+    assay_id_denominator,
+    window_id,
+    window_start,
+    window_end,
+    n_samples,
+  )
+```
+
+#### Save Results
+
+```{r}
+#| label: write-results
+
+all_results[["protein_ratio"]] |>
+  readr::write_tsv(
+    here::here(staging_output_data_dir, "ukb_validation_lists_1-3.tsv.gz")
+  )
+```
+
+#### Plot Results
+
+##### Balance Measures in Covariates
+
+```{r}
+#! label: prep-plot-cobalt-histogram-sex
+
+cobalt_long[["protein_ratio"]] <- all_results[["protein_ratio"]] |>
+  dplyr::select(tidyselect::starts_with("cobalt_")) |>
+  tidyr::pivot_longer(
+    cols = tidyselect::everything(),
+    names_to = "covariate",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    interval_colours = dplyr::case_when(
+      abs(value) >= 0.2 ~ "lightcoral",
+      abs(value) >= 0.1 ~ "tan1",
+      .default = "palegreen3"
+    )
+  )
+
+cobalt_plot[["protein_ratio"]] <- cobalt_long[["protein_ratio"]] |>
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = value,
+      fill = interval_colours
+    )
+  ) +
+  ggplot2::geom_histogram(
+    binwidth = 0.025,
+    colour = "white",
+  ) +
+  ggplot2::facet_wrap(
+    ~ covariate,
+    scales = "free_y",
+    labeller = ggplot2::labeller(
+      covariate = function(x) gsub("^cobalt_", "", x)
+    )
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::labs(
+    x = "Balance Statistic",
+    y = "Count"
+  ) +
+  ggplot2::expand_limits(
+    x = c(-1, 1)
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(-1, 1, by = 0.2)
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1
+    )
+  )
+
+cobalt_hist_plots_pdf[["protein_ratio"]] <- here::here(glue::glue("{staging_output_plot_dir}/cobalt_hist_protein_ratio.pdf"))
+dir.create(dirname(cobalt_hist_plots_pdf[["protein_ratio"]]), showWarnings = FALSE, recursive = TRUE)
+
+ggplot2::ggsave(
+  filename = cobalt_hist_plots_pdf[["protein_ratio"]],
+  plot = cobalt_plot[["protein_ratio"]],
+  width = 15.0, height = 5.0, units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+##### Volcano Plots
+
+```{r}
+#! label: prep-plot-volcano
+
+#####
+# Setup base volcano plot
+#####
+volcano_plot[["protein_ratio"]] <- all_results[["protein_ratio"]] |>
+  plot_volcano(x = "log_or") + ggplot2::geom_point(
+    alpha = 0.7,
+    shape = 16
+  )
+```
+
+```{r}
+#! label: plot-volcanos
+
+#####
+# Plot a single volcano containing all results
+#####
+ggplot2::ggsave(
+  filename = here::here(glue::glue("{staging_output_plot_dir}/volcano_protein_ratio.pdf")),
+  plot = volcano_plot[["protein_ratio"]],
+  width = 6.0, height = 4.0, units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+#####
+# Plot a volcano for each window analysed
+#####
+pdf(here::here(glue::glue("{staging_output_plot_dir}/volcano_by_window_protein_ratio.pdf")), width = 6.0, height = 4.0)
+for (w in unique(all_results[["protein_ratio"]][["window_id"]])) {
+  volcano_plot_window <- volcano_plot[["protein_ratio"]] +
+    ggplot2::geom_point(
+      data = dplyr::filter(all_results[["protein_ratio"]], window_id == w),
+      alpha = 0.7,
+      shape = 16
+    ) +
+    ggplot2::labs(
+      subtitle = glue::glue("Window: {w}")
+    ) +
+    ggplot2::theme_minimal()
+  
+  print(volcano_plot_window)
+}
+dev.off()
+```
+
+##### Protein Pairs: NPX and Ratios
+
+```{r}
+#! label: plot-pairs-expression-profiles
+
+all_pairs_pdf <- here::here(glue::glue("{staging_output_plot_dir}/all_pairs_UKB.pdf"))
+dir.create(dirname(all_pairs_pdf), showWarnings = FALSE, recursive = TRUE)
+
+subdir_pair_id <- here::here(glue::glue("{staging_output_plot_dir}/pair_id"))
+dir.create(subdir_pair_id, showWarnings = FALSE, recursive = TRUE)
+
+pdf(all_pairs_pdf, width = 9.0, height = 4.5)
+lr_data |>
+  dplyr::rename(
+    YEARS_SINCE_ONSET = YEARS_SINCE_ONSET.PD
+  ) |>
+  dplyr::group_by(pair_id) |>
+  tidyr::nest() |>
+  purrr::pwalk(function(pair_id, data) {
+    p <- plot_pair(data, symmetric.y = TRUE)
+    
+    # Also create individual plot files
+    pair_plot_file <- here::here(glue::glue("{staging_output_plot_dir}/pair_id/{pair_id}_UKB.pdf"))
+    dir.create(dirname(pair_plot_file), showWarnings = FALSE, recursive = TRUE)
+    ggplot2::ggsave(
+      filename = pair_plot_file,
+      plot = p,
+      width = 9.0, height = 4.5, units = "in",
+      dpi = 600,
+      bg = "white"
+    )
+  })
+dev.off()
+```
+
+## Upload Outputs to UKB-RAP
+
+```{r}
+#! label: create-tarball
+
+# Prepare tarball
+stage_dir <- glue::glue(getwd(), "/staging/")
+tarball_base <- staging_parent_dir |> stringr::str_replace("/([^\\/]+)$", "_\\1") |> stringr::str_remove(glue::glue(getwd(), "/staging/"))
+staging_parent_subdir <- staging_parent_dir |> stringr::str_remove(glue::glue(getwd(), "/staging/"))
+
+system(
+  glue::glue('cd {stage_dir} && tar -zcf {tarball_base}.tar.gz {staging_parent_subdir}'),
+  intern = TRUE,
+  ignore.stderr = TRUE
+)
+```
+
+```{r}
+#! label: upload-tarball
+
+# Upload to UKB-RAP
+local_file <- glue::glue('staging/{tarball_base}.tar.gz')
+rap_path <- glue::glue("{ukb_rap_working_dir}/protein_expression_analysis/{filename}.tar.gz", filename = staging_parent_dir |> stringr::str_replace("/([^\\/]+)$", "_\\1") |> stringr::str_remove(glue::glue(getwd(), "/staging/")))
+
+ukb_rap_upload(
+  from = local_file,
+  rap_path = rap_path
+)
+```

@@ -1,0 +1,6 @@
+default:
+  src_dir: "src"
+  input_dir: "_input_data"
+  checkpoint_dir: "checkpoint_datasets"
+  output_dir: "_out"
+  log_level: "INFO"

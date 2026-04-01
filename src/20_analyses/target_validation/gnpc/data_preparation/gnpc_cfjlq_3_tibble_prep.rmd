@@ -1,0 +1,605 @@
+---
+title: "GNPC Data 3 Tibble Prep"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+## NOTE:
+## This rmd script can only be executed in AD Workbench environment with approved access to GNPC Harmony Dataset V1.
+## The input/output file paths are set as the defaulted path when the GNPC dataset V1 is approved to be imported into the AD workbench Rstudio environment.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load libraries
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+library(purrr)
+```
+
+```{r, include=TRUE}
+output_version <- "v6"
+```
+
+```{r, include=TRUE, echo=FALSE}
+directories <- c(
+  "/home/rstudio/data_prep",
+  "/home/rstudio/data_prep/annotation",
+  "/home/rstudio/data_prep/metadata",
+  "/home/rstudio/data_prep/proteomics"
+)
+for (directory_path in directories) {
+  dir.create(directory_path, showWarnings = FALSE, recursive = TRUE)
+}
+```
+
+## 1. ANALYTE METADATA (protein target info)
+```{r, include=TRUE}
+analyte_tbl <- read_csv("/home/rstudio/GNPC Harmonised Dataset v1/Clinical/SomalogicAnalyteInfoV1_anonymized.csv",
+  show_col_types = FALSE
+)
+
+analyte_tbl <- as_tibble(analyte_tbl |> select(column_name, everything()), index = column_name)
+
+## Analytes contain non-human targets
+unique(analyte_tbl$organism)
+```
+
+
+```{r, include=TRUE}
+## Filter for human protein analytes
+human_prot_analyte_tbl <- analyte_tbl |>
+  filter(organism == "Human") |>
+  filter(type == "Protein")
+human_prot_analyte_columns <- human_prot_analyte_tbl$column_name
+
+saveRDS(human_prot_analyte_tbl, paste0("/home/rstudio/data_prep/annotation/annotation_tbl_", output_version, ".rds"))
+
+# This file is already tidy: one row per column_name or seq_id
+# So no transformation needed.
+```
+
+
+## 2. PROTEOMICS DATA (protein measurement tibble)
+
+```{r, include=TRUE}
+proteomic_files <- list.files(
+  path = "/home/rstudio/GNPC Harmonised Dataset v1/Clinical",
+  pattern = "Somalogic\\d+V1_anonymized\\.csv$",
+  full.names = TRUE
+)
+
+# Predefine the columns you actually need
+needed_cols <- c("sample_id", "contributor_code", "visit", "sample_type")
+
+# Function to read and clean one proteomic file at a time
+read_and_clean <- function(file, keep_cols = needed_cols) {
+  read_csv(
+    file,
+    show_col_types = FALSE,
+    progress = FALSE,
+    col_select = all_of(keep_cols) | starts_with("seq_")
+  ) |>
+    filter(sample_type == "Sample")
+}
+
+# Process the first file (for metadata)
+first_tbl <- read_and_clean(proteomic_files[[1]])
+metadata_tbl <- first_tbl |> select(all_of(needed_cols))
+
+# Initialize proteomic_tbl with protein data from the first file
+proteomic_tbl <- first_tbl |>
+  select(sample_id, starts_with("seq_"))
+
+# Iteratively join other files, one at a time
+for (f in proteomic_files[-1]) {
+  tmp_tbl <- read_and_clean(f) |>
+    select(sample_id, starts_with("seq_"))
+  proteomic_tbl <- full_join(proteomic_tbl, tmp_tbl, by = "sample_id")
+}
+
+# Finally, filter down to human analytes
+proteomic_tbl <- proteomic_tbl |>
+  select(sample_id, all_of(human_prot_analyte_columns))
+
+# Ensure sample_id is not duplicated
+proteomic_tbl <- proteomic_tbl |>
+  distinct(sample_id, .keep_all = TRUE)
+
+# There are -1 (or rather negative) values to be casted to NA
+proteomic_tbl <- proteomic_tbl |>
+  mutate(across(where(is.numeric), ~ ifelse(. < 0, NA, .)))
+
+# Summarize missingness per column
+missing_proteomic_na_df <- proteomic_tbl |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count")
+
+# Plot histogram of missing values
+ggplot(missing_proteomic_na_df, aes(x = missing_count)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +
+  labs(
+    title = "Histogram of Missing Values per Protein Target",
+    x = "Count of Missing Values",
+    y = "Count of Protein Targets"
+  ) +
+  theme_minimal()
+```
+There is a few protein targets that have high number of missingness (see the short bars on the right). But overall, there are not much missingness. The per contributor missingness will be examined later.
+
+
+```{r, include=TRUE}
+# proteomic_tbl now has columns as :
+# sample_id | protein columns...
+# and with only "Sample" values as in the original 'sample_type' col
+
+# save to RDS for now
+proteomic_tbl <- as_tibble(proteomic_tbl, index = sample_id)
+saveRDS(proteomic_tbl, paste0("/home/rstudio/data_prep/proteomics/proteomic_tbl_", output_version, ".rds"))
+```
+
+
+
+## 3. CLINICAL DATA (clinical tibble with patient mapping, and sample_matrix from meta table)
+```{r, include=TRUE}
+# Read clinical file, person mapping file, and
+clinical_raw <- read_csv("/home/rstudio/GNPC Harmonised Dataset v1/Clinical/ClinicalV1_anonymized.csv", show_col_types = FALSE)
+person_map <- read_csv("/home/rstudio/GNPC Harmonised Dataset v1/Clinical/PersonMappingV1_anonymized.csv",
+  show_col_types = FALSE
+)
+metadata_tbl <- read_csv("/home/rstudio/GNPC Harmonised Dataset v1/Clinical/SomalogicMetaV1_anonymized.csv",
+  show_col_types = FALSE
+)
+# person_map has: person_id, sample_id
+# Read lookup table
+gnpc_lookup_map <- read_csv("/home/rstudio/GNPC Harmonised Dataset v1/Clinical/GNPCLookupV1_anonymized.csv",
+  show_col_types = FALSE
+)
+
+
+# Merge metadata from protein table with clinical
+clinical_plus <- metadata_tbl |>
+  select(sample_id, visit, sample_type) |>
+  left_join(clinical_raw, by = "sample_id")
+
+# Merge sample matrix col from meta table with clinical
+clinical_plus_2 <- metadata_tbl |>
+  select(sample_id, sample_matrix) |>
+  left_join(clinical_plus, by = "sample_id")
+
+# Merge clinical + mapping
+clinical_tbl <- clinical_plus_2 |>
+  left_join(person_map, by = "sample_id") |>
+  relocate(person_id, .after = sample_id)
+
+# clinical_tbl now has patient IDs (person_id) alongside sample-level clinical data
+
+# Factorize contributor
+clinical_tbl <- clinical_tbl |> mutate(contributor_code = factor(contributor_code))
+```
+
+### Examine the pd changes in patients
+```{r, include=TRUE}
+clinical_samples_with_pd_changes <- clinical_tbl |>
+  group_by(person_id) |>
+  filter(n_distinct(pd) > 1) |>
+  ungroup() |>
+  select(sample_id, person_id, contributor_code, visit, pd) |>
+  arrange(person_id, visit)
+
+
+plot_pd_by_person <- function(data, jitter_width = 0.1) {
+  # Check required columns
+  required_cols <- c("person_id", "contributor_code", "visit", "pd")
+  if (!all(required_cols %in% colnames(data))) {
+    stop("Data must have columns: person_id, contributor_code, visit, pd")
+  }
+
+  data |>
+    arrange(person_id, visit) |>
+    ggplot(aes(
+      x = visit,
+      y = pd,
+      group = person_id,
+      color = contributor_code
+    )) +
+    geom_line(
+      linewidth = 1,
+      alpha = 0.7,
+      position = position_jitter(width = jitter_width, height = 0)
+    ) +
+    geom_point(
+      size = 3,
+      position = position_jitter(width = jitter_width, height = 0)
+    ) +
+    scale_y_continuous(breaks = seq(-1, 2, 1)) +
+    labs(
+      title = "PD Diagnosis Progression by Person",
+      x = "Visit",
+      y = "PD Diagnosis",
+      color = "Contributor"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+plot_pd_by_person(clinical_samples_with_pd_changes)
+```
+It appears that only 4-5 patients may have different pd labelings through a history of visits but most patients for the four important contributors (C, F, J, L, Q) have only one pd labelings (0 or 1). Conclusion: if we are OK to lose a few samples/persons from contributor J, we can accept to cast pd into just 0, 1 factors since most persons are labeled with one diagnosis of pd.
+
+
+```{r, include=TRUE}
+## Find out about the pd and # of samples per person distributions across the CFJLQ cohorts
+clinical_tbl |>
+  select(contributor_code, person_id, sample_id, pd) |>
+  group_by(contributor_code, person_id, pd) |>
+  summarise(n_samples = n(), .groups = "keep") |>
+  group_by(contributor_code, n_samples, pd) |>
+  summarise(count = n(), .groups = "keep") |>
+  filter(contributor_code %in% c("C", "F", "J", "L", "Q"))
+```
+
+
+### Check out the proteomics (downsampled) value distributions per contributor
+```{r, include=TRUE}
+proteomic_tbl_w_contributor <- inner_join(clinical_tbl[c("sample_id", "contributor_code")], proteomic_tbl, by = "sample_id")
+
+plot_contributor_median <- function(data, n_samples = 5000, seed = 123) {
+  set.seed(seed)
+
+  # Identify numeric columns
+  numeric_cols <- names(data)[!(names(data) %in% c("sample_id", "contributor_code"))]
+
+  # Optional: downsample rows for speed
+  if (n_samples < nrow(data)) {
+    data <- data |> slice_sample(n = n_samples)
+  }
+
+  # Compute median per sample across all numeric columns
+  data <- data |>
+    rowwise() |>
+    mutate(sample_median = median(c_across(all_of(numeric_cols)), na.rm = TRUE)) |>
+    ungroup()
+
+  # Summarize per contributor
+  summary_df <- data |>
+    group_by(contributor_code) |>
+    summarise(
+      median_of_medians = median(sample_median, na.rm = TRUE),
+      q25 = quantile(sample_median, 0.25, na.rm = TRUE),
+      q75 = quantile(sample_median, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Plot: median with IQR as error bars
+  ggplot(summary_df, aes(x = contributor_code, y = median_of_medians)) +
+    geom_point(size = 3, color = "blue") +
+    geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.2, color = "darkgray") +
+    theme_minimal() +
+    labs(
+      title = "Sample Median of Measurements by Contributor",
+      x = "Contributor",
+      y = "Median of Sample Medians"
+    )
+}
+plot_contributor_median(proteomic_tbl_w_contributor, n_samples = 1000)
+```
+
+### Check out the proteomics (downsampled) value missingness per contributor
+```{r, include=TRUE}
+plot_contributor_missingness <- function(data, n_samples = 5000, seed = 123) {
+  set.seed(seed)
+
+  # Optional: downsample rows for speed
+  if (n_samples < nrow(data)) {
+    data <- data |> slice_sample(n = n_samples)
+  }
+
+  # Identify numeric/measurement columns
+  measurement_cols <- names(data)[!(names(data) %in% c("sample_id", "contributor_code"))]
+
+  # Compute fraction of missing values per sample
+  data <- data |>
+    rowwise() |>
+    mutate(missing_frac = sum(is.na(c_across(all_of(measurement_cols)))) / length(measurement_cols)) |>
+    ungroup()
+
+  # Summarize per contributor
+  summary_df <- data |>
+    group_by(contributor_code) |>
+    summarise(
+      mean_missing = mean(missing_frac, na.rm = TRUE),
+      median_missing = median(missing_frac, na.rm = TRUE),
+      q25 = quantile(missing_frac, 0.25, na.rm = TRUE),
+      q75 = quantile(missing_frac, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Plot
+  ggplot(summary_df, aes(x = contributor_code, y = median_missing)) +
+    geom_point(size = 3, color = "red") +
+    geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.2, color = "darkgray") +
+    theme_minimal() +
+    labs(
+      title = "Missingness per Contributor",
+      x = "Contributor",
+      y = "Median Fraction of Missing Values"
+    )
+}
+
+plot_contributor_missingness(proteomic_tbl_w_contributor, n_samples = 1000)
+```
+
+### Alternatively check out the proteomics (downsampled) value distribution using density plot per contributor
+```{r, include=TRUE}
+plot_contributor_density <- function(data, n_samples = 5000, n_features = 200,
+                                     lower_pct = 0.001, upper_pct = 0.999,
+                                     seed = 123) {
+  set.seed(seed)
+
+  # Downsample rows
+  if (n_samples < nrow(data)) {
+    data <- data |> slice_sample(n = n_samples)
+  }
+
+  # Select numeric measurement columns
+  numeric_cols <- setdiff(names(data), c("sample_id", "contributor_code"))
+
+  # Downsample columns
+  if (n_features < length(numeric_cols)) {
+    numeric_cols <- sample(numeric_cols, n_features)
+  }
+
+  # Convert to long format
+  long_df <- data |>
+    select(contributor_code, all_of(numeric_cols)) |>
+    pivot_longer(
+      cols = all_of(numeric_cols),
+      names_to = "feature",
+      values_to = "value"
+    ) |>
+    filter(!is.na(value))
+
+  # Percentile capping
+  q_low <- quantile(long_df$value, lower_pct, na.rm = TRUE)
+  q_high <- quantile(long_df$value, upper_pct, na.rm = TRUE)
+
+  long_df <- long_df |>
+    mutate(value = pmin(pmax(value, q_low), q_high))
+
+  # Calculate median for label positions
+  label_positions <- long_df |>
+    group_by(contributor_code) |>
+    summarise(median_val = median(value, na.rm = TRUE), .groups = "drop")
+
+  # Density plot
+  ggplot(long_df, aes(x = value, color = contributor_code, fill = contributor_code)) +
+    geom_density(alpha = 0.3) +
+    scale_x_log10() +
+    geom_text_repel(
+      data = label_positions,
+      aes(x = median_val, y = 0, label = contributor_code, color = contributor_code),
+      inherit.aes = FALSE,
+      size = 3,
+      direction = "y",
+      nudge_y = 0.05,
+      show.legend = FALSE
+    ) +
+    theme_minimal() +
+    labs(
+      title = paste("Density of Measurements per Contributor (log-scale, capped at ",
+        lower_pct * 100, "–", upper_pct * 100, " percentiles)",
+        sep = ""
+      ),
+      x = "Measurement Value (log10 scale)",
+      y = "Density",
+      color = "Contributor",
+      fill = "Contributor"
+    )
+}
+
+plot_contributor_density(proteomic_tbl_w_contributor,
+  n_samples = 1000, n_features = 2000
+)
+```
+
+#### Clean up clinical table
+```{r, include=TRUE}
+# Function to label NA values in clinical table
+clean_clinical_tbl <- function(df) {
+  # Lookup table: columns mapped to values to convert to NA
+  na_codes <- list(
+    age_at_visit = c(-1),
+    sex = c(-1),
+    race = c(-1),
+    bmi = c(-1),
+    years_of_education = c(-1),
+    computed_age_range = c(-1),
+    computed_years_education_range = c(-1),
+    computed_height_range = c(-2, -1),
+    computed_weight_range = c(-1),
+    computed_bmi_range = c(-1),
+    computed_pulse_range = c(-1),
+    computed_systolic_blood_pressure_range = c(-1),
+    computed_diastolic_blood_pressure_range = c(-2, -1),
+    alcohol_hx = c(-1),
+    smoking_hx = c(-1),
+    computed_years_smoked = c(-2, -1),
+    total_years_smoked = c(-1),
+    stroke = c(-1, 2), # 2 = Unsure
+    tia = c(-1, 2),
+    tbi = c(-1, 2),
+    recruited_control = c(-1, 2),
+    ad = c(-1, 2),
+    ftd = c(-1, 2),
+    pd = c(-1, 2),
+    als = c(-1, 2),
+    mci_sci = c(-1, 2),
+    cancer = c(-1, 2),
+    diabetes = c(-1, 2),
+    chf = c(-1, 2),
+    copd = c(-1, 2),
+    mi = c(-1, 2),
+    afib = c(-1, 2),
+    angina = c(-1, 2),
+    hyperlipidaemia = c(-1, 2),
+    hypertension = c(-1, 2),
+    depression = c(-1, 2),
+    depression_test_battery = c("N/A"),
+    anxiety = c(-1),
+    cdr = c(-1),
+    computed_cognitive_test_score = c(-6, -5, -4, -3, -2, -1), ## all neg scores mean incomplete
+    cognitive_test_battery = c("N/A"),
+    computed_clinical_diagnosis = c(-1),
+    computed_cognitive_impairment = c(-1),
+    is_neuropath = c(-1),
+    is_biomarker = c(-1),
+    cognitive_test_date = c("1/1/1900"),
+    resting_heart_rate_pulse = c(-1),
+    systolic_blood_pressure_sitting = c(-1),
+    diastolic_blood_pressure_sitting = c(-1),
+    depression_inventory_score = c(-1),
+    cognitive_test_score = c(-1),
+    sample_matrix = c("-1")
+  )
+
+  # Loop over each column and replace codes with NA if applicable
+  for (col in names(na_codes)) {
+    if (col %in% names(df)) {
+      df[[col]] <- ifelse(df[[col]] %in% na_codes[[col]], NA, df[[col]])
+    }
+  }
+
+  return(df)
+}
+
+# clean up clinical_tbl
+cleaned_clinical_tbl <- clean_clinical_tbl(clinical_tbl)
+
+map_clinical_tbl <- function(df, lookup) {
+  # Simplify descriptions (make concise but meaningful)
+  simplify_desc <- function(desc) {
+    desc <- trimws(desc)
+    desc <- gsub("Not Stated", NA, desc)
+    desc <- gsub("N/A", NA, desc)
+    desc <- gsub("Z=-1 to Z=1", "Normal abs(Z) <= 1", desc)
+    desc <- gsub("Z=-2 to Z=-1 and Z=1 to Z=2", "Mild dev abs(Z) <= 2", desc)
+    desc <- gsub("Z=-3 to Z=-2 and Z=2 to Z=3", "Moderate dev abs(Z) <= 3", desc)
+    desc <- gsub("Z<3 and Z>3", "Severe dev abs(Z) > 3", desc)
+    desc <- gsub("Incompatible data", "Invalid", desc)
+    desc <- gsub("Yes", "Yes", desc)
+    desc <- gsub("No", "No", desc)
+    desc <- gsub("Unsure", NA, desc)
+    desc <- gsub("Male", "Male", desc)
+    desc <- gsub("Female", "Female", desc)
+    desc <- gsub("Never_or_Previous", "Never/Prev", desc)
+    desc <- gsub("Current", "Current", desc)
+    desc <- gsub("Previous", "Previous", desc)
+    desc <- gsub("Other\\(.*\\)", "Other", desc)
+    desc <- gsub("_", " ", desc)
+    desc
+  }
+
+  lookup$key_description <- vapply(lookup$key_description, simplify_desc, FUN.VALUE = character(1))
+
+  # Build nested mapping list
+  map_list <- lookup |>
+    filter(!is.na(key_description)) |>
+    group_by(column_name) |>
+    summarize(mapping = list(setNames(key_description, key_lookup)), .groups = "drop")
+
+  map_dict <- setNames(map_list$mapping, map_list$column_name)
+
+  # Apply mappings
+  for (col in names(df)) {
+    if (col %in% names(map_dict)) {
+      # Replace using named vector
+      df[[col]] <- as.character(df[[col]])
+      df[[col]] <- recode(df[[col]], !!!map_dict[[col]])
+      df[[col]][df[[col]] == ""] <- NA # empty strings → NA
+    }
+  }
+
+  return(df)
+}
+
+# map clinical_tbl
+mapped_cleaned_clinical_tbl <- map_clinical_tbl(cleaned_clinical_tbl, gnpc_lookup_map)
+
+# Process BMI
+mapped_cleaned_clinical_tbl <- mapped_cleaned_clinical_tbl |>
+  mutate(
+    bmi_clean = str_replace_all(bmi, "[^0-9\\.-]", ""),
+    bmi_low = as.numeric(str_extract(bmi_clean, "^[0-9]+\\.?[0-9]*")),
+    bmi_high = as.numeric(str_extract(bmi_clean, "(?<=-)[0-9]+\\.?[0-9]*")),
+    bmi_mid = ifelse(!is.na(bmi_high), (bmi_low + bmi_high) / 2, bmi_low),
+    bmi_cat = case_when(
+      is.na(bmi_mid) ~ NA_character_,
+      bmi_mid < 18.5 ~ "underweight",
+      bmi_mid < 25 ~ "normal",
+      bmi_mid < 30 ~ "overweight",
+      bmi_mid < 35 ~ "obesity_1",
+      bmi_mid < 40 ~ "obesity_2",
+      TRUE ~ "obesity_3"
+    )
+  )
+
+
+# Numeric coercions
+num_cols <- c(
+  "years_of_education", "age_at_visit", "computed_years_education_range",
+  "computed_height_range", "computed_weight_range", "computed_bmi_range",
+  "resting_heart_rate_pulse", "computed_pulse_range", "systolic_blood_pressure_sitting",
+  "diastolic_blood_pressure_sitting", "total_years_smoked", "depression_inventory_score",
+  "cognitive_test_score", "bmi_low", "bmi_high", "bmi_mid"
+)
+mapped_cleaned_clinical_tbl <- mapped_cleaned_clinical_tbl |> mutate(across(all_of(num_cols), ~ as.numeric(.)))
+
+# categorical coercions
+cat_cols <- c(
+  "computed_age_range", "sex", "race", "computed_years_education_range",
+  "computed_height_range", "computed_weight_range", "computed_bmi_range",
+  "computed_pulse_range", "computed_systolic_blood_pressure_range",
+  "computed_diastolic_blood_pressure_range", "alcohol_hx", "smoking_hx",
+  "computed_years_smoked", "stroke", "tia", "tbi", "recruited_control",
+  "ad", "ftd", "pd", "als", "mci_sci", "cancer", "diabetes", "chf", "copd",
+  "mi", "afib", "angina", "hyperlipidaemia", "hypertension", "depression",
+  "anxiety", "cdr", "computed_cognitive_test_score", "computed_clinical_diagnosis",
+  "computed_cognitive_impairment", "is_neuropath", "is_biomarker", "is_somalogic",
+  "is_mass_spec", "bmi_clean", "depression_test_battery", "cognitive_test_date",
+  "cognitive_test_battery", "bmi", "bmi_cat"
+)
+mapped_cleaned_clinical_tbl <- mapped_cleaned_clinical_tbl |> mutate(across(all_of(cat_cols), ~ as.factor(.)))
+
+# save to RDS for now
+mapped_cleaned_clinical_tbl <- as_tibble(mapped_cleaned_clinical_tbl, index = sample_id)
+saveRDS(mapped_cleaned_clinical_tbl, paste0("/home/rstudio/data_prep/metadata/clinical_metadata_tbl_", output_version, ".rds"))
+```
+
+
+## 4. Save per Cohort Data (select individual contributor CFJLQ) 
+```{r, include=TRUE}
+# selected cohorts (contributors)
+selected_contributors <- c("C", "F", "J", "L", "Q")
+
+for (sel_con in selected_contributors) {
+  clin_rds_file_per_cohort <- paste0("/home/rstudio/data_prep/metadata/clinical_metadata_tbl_", output_version, "_contributor_", sel_con, ".rds")
+  clin_tbl_per_cohort <- mapped_cleaned_clinical_tbl |>
+    filter(contributor_code == sel_con)
+  saveRDS(clin_tbl_per_cohort, clin_rds_file_per_cohort)
+
+  sample_ids_per_cohort <- clin_tbl_per_cohort$sample_id
+  cat("Contributor Code", sel_con, length(sample_ids_per_cohort), "Samples\n")
+
+  prot_rds_file_per_cohort <- paste0("/home/rstudio/data_prep/proteomics/proteomic_tbl_", output_version, "_contributor_", sel_con, ".rds")
+  proteomic_tbl_per_cohort <- proteomic_tbl |>
+    filter(sample_id %in% sample_ids_per_cohort)
+  saveRDS(proteomic_tbl_per_cohort, prot_rds_file_per_cohort)
+}
+```

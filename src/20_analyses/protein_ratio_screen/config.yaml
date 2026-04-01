@@ -1,0 +1,72 @@
+out_parent_dir: "output"
+
+parameter_sets:
+  - window_start: -10
+    window_end: -8
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -9
+    window_end: -7
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -8
+    window_end: -6
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -7
+    window_end: -5
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -6
+    window_end: -4
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -5
+    window_end: -3
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -4
+    window_end: -2
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -3
+    window_end: -1
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -Inf
+    window_end: -1
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: 0
+    window_end: Inf
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -Inf
+    window_end: -7
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -9
+    window_end: -5
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -7
+    window_end: -3
+    strategy: middle
+    training_proportion: 1.0
+  - window_start: -5
+    window_end: -1
+    strategy: middle
+    training_proportion: 1.0
+
+training_data:
+    permute: false
+
+vfold_cv:
+  partitions: 3
+  repeats: 3
+
+jobs:
+  max_numerators_per_job: 99999999
+  debug_level: debug
+
+n_test_denominators: 2

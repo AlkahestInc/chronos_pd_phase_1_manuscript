@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+_input_data
+checkpoint_datasets
+_out
+*.log
+*.pdf
+renv.lock

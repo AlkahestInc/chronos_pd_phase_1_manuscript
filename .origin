@@ -1,0 +1,33 @@
+ask_before_applying_changes: true
+use_markers_for_logging: true
+check_conflicts: false
+check_base_conflicts: true
+check_local_conflicts: true
+overwrite: true
+verbose: true
+add_base_packages: false
+excluded_functions: []
+path_to_local_functions: ./packages
+
+pkgs:
+  - tidyselect
+  - tibble
+  - readr
+  - stringr
+  - purrr
+  - forcats
+  - lubridate
+  - tidyr
+  - dbplyr
+  - dplyr
+  - ggplot2
+  - ggrepel
+  - glue
+  - logger
+filetypes:
+  - R
+  - Qmd
+  - Rmd
+color_added_package: "#00F9FF"
+color_infix_function: "#ffa500"
+color_missed_function: "#ff0000"
